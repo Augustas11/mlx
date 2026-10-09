@@ -1859,12 +1859,11 @@ void dispatch_qmv(
     return;
   }
 
-  // Small batch so route to qmv_wide, which reuses each weight group across the
-  // M vectors.
-  if (M >= 2 && use_qmv_wide(mode, d) && !global_scale) {
-    qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
-    return;
-  }
+  // macprovider: no qmv_wide. It reduces each vector in a different order
+  // from qmv, so a row's result would depend on how many rows share the call
+  // (M = 1 takes qmv, 2 <= M < vector_limit takes qmv_wide). Continuous
+  // batching needs every row to match its serial M = 1 result exactly, so
+  // every small-M product stays on qmv, as in MLX 0.31.
   qmv(x,
       w,
       scales,
@@ -1907,13 +1906,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto mode = quantization_mode_to_string(mode_);
   // It is a matrix matrix product.
   if (M >= vector_limit) {
-    // Use split-K qmm for small M with transposed weights (non-batched only)
-    int B = out.size() / M / N;
-    if (transpose_ && B == 1) {
-      qmm_splitk(
-          x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
-      return;
-    }
+    // macprovider: no qmm_splitk. Its split count follows the M tile count,
+    // so the same row sums K in a different order when the call carries more
+    // rows (a 2-row prefill chunk vs the 1-row serial chunk). qmm reduces K
+    // in one fixed order for every M, which keeps rows batch-invariant.
     qmm(x,
         w,
         scales,
