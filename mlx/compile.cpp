@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
@@ -411,8 +412,28 @@ class CompileCache {
   std::shared_mutex mutex_;
 };
 
+// Every thread's compile cache, so that a function id can be erased from all
+// of them (see compile_erase). Leaked on purpose: thread-local caches can be
+// destroyed after static destructors have run.
+struct CompileCacheRegistry {
+  std::mutex mutex;
+  std::vector<std::weak_ptr<CompileCache>> caches;
+};
+
+CompileCacheRegistry& compile_cache_registry() {
+  static auto* registry = new CompileCacheRegistry();
+  return *registry;
+}
+
 std::shared_ptr<CompileCache>& compile_cache_unsafe() {
-  static thread_local auto cache = std::make_shared<CompileCache>();
+  static thread_local auto cache = [] {
+    auto cache = std::make_shared<CompileCache>();
+    auto& registry = compile_cache_registry();
+    std::lock_guard lock(registry.mutex);
+    std::erase_if(registry.caches, [](const auto& c) { return c.expired(); });
+    registry.caches.push_back(cache);
+    return cache;
+  }();
   return cache;
 }
 
@@ -1219,8 +1240,26 @@ CompileCacheWeakPtr compile_cache() {
   return compile_cache_unsafe();
 }
 
-void compile_erase(const CompileCacheWeakPtr& cache, std::uintptr_t fun_id) {
-  if (auto p = cache.lock()) {
+void compile_erase(const CompileCacheWeakPtr&, std::uintptr_t fun_id) {
+  // A function id names one function process-wide, but its traces live in the
+  // cache of every thread that called it. Erasing only the given thread's
+  // cache leaves the other threads holding dead traces, and a new function
+  // that reuses the id (e.g. allocated at the same address) would replay them,
+  // constants included. So erase the id from every live thread's cache.
+  // CompileCache::erase is safe to call from another thread: it takes the
+  // cache's exclusive lock, and entries in use are kept alive by find().
+  std::vector<std::shared_ptr<CompileCache>> caches;
+  {
+    auto& registry = compile_cache_registry();
+    std::lock_guard lock(registry.mutex);
+    caches.reserve(registry.caches.size());
+    for (auto& c : registry.caches) {
+      if (auto p = c.lock()) {
+        caches.push_back(std::move(p));
+      }
+    }
+  }
+  for (auto& p : caches) {
     p->erase(fun_id);
   }
 }

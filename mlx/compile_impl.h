@@ -32,7 +32,7 @@ class CompileCache;
 using CompileCacheWeakPtr = std::weak_ptr<CompileCache>;
 MLX_API CompileCacheWeakPtr compile_cache();
 
-// Erase cached compile function.
+// Erase a cached compile function from every thread's cache.
 MLX_API void compile_erase(
     const CompileCacheWeakPtr& cache,
     std::uintptr_t fun_id);
