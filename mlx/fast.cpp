@@ -352,7 +352,7 @@ array layer_norm(
     auto xc = subtract(x, mu, s);
     auto v = mean(square(xc, s), /* axis= */ -1, /* keepdims= */ true, s);
 
-    x = multiply(xc, rsqrt(add(v, array(eps, float32), s), s));
+    x = multiply(xc, rsqrt(add(v, array(eps, float32), s), s), s);
     x = astype(x, out_type, s);
 
     // If the LN is affine then transform x according to the weight and bias
@@ -405,7 +405,7 @@ std::vector<array> LayerNorm::vjp(
     auto mu = multiply(sumx, norm, s);
     auto mu2 = multiply(sumx2, norm, s);
     auto var = subtract(mu2, square(mu, s), s);
-    auto n = rsqrt(add(var, array(eps, x.dtype()), s));
+    auto n = rsqrt(add(var, array(eps, x.dtype()), s), s);
     auto n3 = power(n, array(3, x.dtype()), s);
     auto x_c = subtract(x, mu, s);
 

@@ -6524,7 +6524,8 @@ array number_of_elements(
       dtype,
       std::make_shared<NumberOfElements>(
           to_stream(s), std::move(axes), inverted, dtype),
-      {a}));
+      {a}),
+      s);
 }
 
 array conjugate(const array& a, StreamOrDevice s /* = {} */) {
@@ -6752,7 +6753,7 @@ array real(const array& a, StreamOrDevice s /* = {} */) {
 
 array imag(const array& a, StreamOrDevice s /* = {} */) {
   if (!issubdtype(a.dtype(), complexfloating)) {
-    return zeros_like(a);
+    return zeros_like(a, s);
   }
   return array(a.shape(), float32, std::make_shared<Imag>(to_stream(s)), {a});
 }
