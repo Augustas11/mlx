@@ -4969,7 +4969,21 @@ void init_ops(nb::module_& m) {
       )pbdoc");
   m.def(
       "gather_qmm",
-      &mx::gather_qmm,
+      // macprovider: mlx/ops.h also declares the pre-global_scale overload.
+      nb::overload_cast<
+          const mx::array&,
+          const mx::array&,
+          const mx::array&,
+          const std::optional<mx::array>&,
+          std::optional<mx::array>,
+          std::optional<mx::array>,
+          bool,
+          std::optional<int>,
+          std::optional<int>,
+          const std::string&,
+          const std::optional<mx::array>&,
+          bool,
+          mx::StreamOrDevice>(&mx::gather_qmm),
       nb::arg(),
       nb::arg(),
       "scales"_a,

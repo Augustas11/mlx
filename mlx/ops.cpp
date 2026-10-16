@@ -5826,6 +5826,35 @@ array gather_qmm(
       std::move(inputs));
 }
 
+array gather_qmm(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    std::optional<array> lhs_indices,
+    std::optional<array> rhs_indices,
+    bool transpose,
+    std::optional<int> group_size,
+    std::optional<int> bits,
+    const std::string& mode,
+    bool sorted_indices,
+    StreamOrDevice s /* = {} */) {
+  return gather_qmm(
+      x,
+      w,
+      scales,
+      biases,
+      std::move(lhs_indices),
+      std::move(rhs_indices),
+      transpose,
+      group_size,
+      bits,
+      mode,
+      std::nullopt,
+      sorted_indices,
+      s);
+}
+
 array gather_qqmm(
     const array& x,
     const array& w,
