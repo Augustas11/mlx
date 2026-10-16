@@ -1834,7 +1834,7 @@ std::vector<array> Depends::vjp(
     if (arg < cotangents.size()) {
       vjps.push_back(cotangents[arg]);
     } else {
-      vjps.push_back(zeros_like(primals[arg]));
+      vjps.push_back(zeros_like(primals[arg], stream()));
     }
   }
   return vjps;
@@ -4647,7 +4647,10 @@ std::vector<array> Scatter::vjp(
           auto gathered_result =
               gather(result, indices, axes_, slice_sizes, stream());
           vjps.push_back(
-              multiply(gathered_cotan, gathered_result == updates, stream()));
+              multiply(
+                  gathered_cotan,
+                  equal(gathered_result, updates, stream()),
+                  stream()));
           break;
         }
         default: {
