@@ -559,7 +559,7 @@ std::vector<array> ArcTan2::vjp(
 
   std::vector<array> grads;
   array dy_over_x1_x2_squared =
-      divide(dy, add(square(x1, s), square(x2, s)), s);
+      divide(dy, add(square(x1, s), square(x2, s), s), s);
 
   for (auto arg : argnums) {
     if (arg == 0) {
@@ -3293,7 +3293,7 @@ std::vector<array> Select::jvp(
 
   array jvp = jvp_fun(0);
   for (int i = 1; i < argnums.size(); i++) {
-    jvp = add(jvp, jvp_fun(i));
+    jvp = add(jvp, jvp_fun(i), stream());
   }
   return {jvp};
 }
@@ -4374,7 +4374,8 @@ std::vector<array> Scan::vjp(
                 inclusive_,
                 stream()),
             x,
-            stream()));
+            stream()),
+        stream());
     auto output_neg = exp(
         add(logcumsumexp(
                 subtract(log_grad_negative, results, stream()),
@@ -4383,7 +4384,8 @@ std::vector<array> Scan::vjp(
                 inclusive_,
                 stream()),
             x,
-            stream()));
+            stream()),
+        stream());
 
     return {subtract(output_pos, output_neg, stream())};
   } else if (reduce_type_ == Scan::Prod) {
@@ -4531,7 +4533,8 @@ std::vector<array> Scan::jvp(
             inclusive_,
             stream()),
         y,
-        stream()));
+        stream()),
+        stream());
 
     auto out_neg = exp(subtract(
         logcumsumexp(
@@ -4541,7 +4544,8 @@ std::vector<array> Scan::jvp(
             inclusive_,
             stream()),
         y,
-        stream()));
+        stream()),
+        stream());
 
     return {where(
         isneginf(y, stream()),
@@ -5537,7 +5541,8 @@ std::vector<array> Softmax::vjp(
   auto sv = multiply(s, cotangents[0], stream());
   return {subtract(
       sv,
-      multiply(s, sum(sv, std::vector<int>{-1}, true, stream()), stream()))};
+      multiply(s, sum(sv, std::vector<int>{-1}, true, stream()), stream()),
+      stream())};
 }
 
 std::vector<array> Softmax::jvp(
@@ -5550,7 +5555,8 @@ std::vector<array> Softmax::jvp(
   auto sv = multiply(s, tangents[0], stream());
   return {subtract(
       sv,
-      multiply(s, sum(sv, std::vector<int>{-1}, true, stream()), stream()))};
+      multiply(s, sum(sv, std::vector<int>{-1}, true, stream()), stream()),
+      stream())};
 }
 
 bool Softmax::is_equivalent(const Primitive& other) const {
