@@ -945,7 +945,8 @@ array scaled_dot_product_attention(
       mask = where(
           mask,
           full_like(mask, 0, final_type, s),
-          full_like(mask, -inf, final_type, s));
+          full_like(mask, -inf, final_type, s),
+          s);
     }
     Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
     auto primitive = std::make_shared<ScaledDotProductAttention>(
