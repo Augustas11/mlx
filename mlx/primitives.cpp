@@ -536,7 +536,7 @@ std::vector<array> ArcTan2::vjp(
 
   std::vector<array> grads;
   array dy_over_x1_x2_squared =
-      divide(dy, add(square(x1, s), square(x2, s)), s);
+      divide(dy, add(square(x1, s), square(x2, s), s), s);
 
   for (auto arg : argnums) {
     if (arg == 0) {
@@ -1797,7 +1797,7 @@ std::vector<array> Depends::vjp(
     if (arg < cotangents.size()) {
       vjps.push_back(cotangents[arg]);
     } else {
-      vjps.push_back(zeros_like(primals[arg]));
+      vjps.push_back(zeros_like(primals[arg], stream()));
     }
   }
   return vjps;
@@ -3230,7 +3230,7 @@ std::vector<array> Select::jvp(
 
   array jvp = jvp_fun(0);
   for (int i = 1; i < argnums.size(); i++) {
-    jvp = add(jvp, jvp_fun(i));
+    jvp = add(jvp, jvp_fun(i), stream());
   }
   return {jvp};
 }
@@ -4303,7 +4303,8 @@ std::vector<array> Scan::vjp(
                 inclusive_,
                 stream()),
             x,
-            stream()));
+            stream()),
+        stream());
     auto output_neg = exp(
         add(logcumsumexp(
                 subtract(log_grad_negative, results, stream()),
@@ -4312,7 +4313,8 @@ std::vector<array> Scan::vjp(
                 inclusive_,
                 stream()),
             x,
-            stream()));
+            stream()),
+        stream());
 
     return {subtract(output_pos, output_neg, stream())};
   } else if (reduce_type_ == Scan::Prod) {
@@ -4529,7 +4531,10 @@ std::vector<array> Scatter::vjp(
           auto gathered_result =
               gather(result, indices, axes_, slice_sizes, stream());
           vjps.push_back(
-              multiply(gathered_cotan, gathered_result == updates, stream()));
+              multiply(
+                  gathered_cotan,
+                  equal(gathered_result, updates, stream()),
+                  stream()));
           break;
         }
         default: {
@@ -5418,7 +5423,8 @@ std::vector<array> Softmax::vjp(
   auto sv = multiply(s, cotangents[0], stream());
   return {subtract(
       sv,
-      multiply(s, sum(sv, std::vector<int>{-1}, true, stream()), stream()))};
+      multiply(s, sum(sv, std::vector<int>{-1}, true, stream()), stream()),
+      stream())};
 }
 
 std::vector<array> Softmax::jvp(
@@ -5431,7 +5437,8 @@ std::vector<array> Softmax::jvp(
   auto sv = multiply(s, tangents[0], stream());
   return {subtract(
       sv,
-      multiply(s, sum(sv, std::vector<int>{-1}, true, stream()), stream()))};
+      multiply(s, sum(sv, std::vector<int>{-1}, true, stream()), stream()),
+      stream())};
 }
 
 bool Softmax::is_equivalent(const Primitive& other) const {
