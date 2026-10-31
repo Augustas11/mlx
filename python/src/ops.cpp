@@ -4778,7 +4778,18 @@ void init_ops(nb::module_& m) {
       )pbdoc");
   m.def(
       "quantized_matmul",
-      &mx::quantized_matmul,
+      [](const mx::array& x,
+         const mx::array& w,
+         const mx::array& scales,
+         const std::optional<mx::array>& biases,
+         bool transpose,
+         std::optional<int> group_size,
+         std::optional<int> bits,
+         const std::string& mode,
+         mx::StreamOrDevice stream) {
+        return mx::quantized_matmul(
+            x, w, scales, biases, transpose, group_size, bits, mode, stream, false);
+      },
       nb::arg(),
       nb::arg(),
       "scales"_a,
