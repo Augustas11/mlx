@@ -4943,7 +4943,8 @@ array quantized_matmul(
     std::optional<int> group_size_ /* = std::nullopt */,
     std::optional<int> bits_ /* = std::nullopt */,
     const std::string& mode /* = "affine" */,
-    StreamOrDevice s /* = {} */) {
+    StreamOrDevice s /* = {} */,
+    bool reference_prefill /* = false */) {
   auto [dtype, qmode] = validate_mode_with_type(
       "quantized_matmul", scales, biases, std::nullopt, mode);
 
@@ -4985,7 +4986,7 @@ array quantized_matmul(
       std::move(out_shape),
       dtype,
       std::make_shared<QuantizedMatmul>(
-          to_stream(s), group_size, bits, qmode, transpose),
+          to_stream(s), group_size, bits, qmode, transpose, reference_prefill),
       std::move(inputs));
 }
 

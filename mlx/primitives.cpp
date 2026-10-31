@@ -3615,7 +3615,8 @@ std::vector<array> QuantizedMatmul::vjp(
           group_size_,
           bits_,
           quantization_mode_to_string(mode_),
-          stream()));
+          stream(),
+          reference_prefill_));
     }
 
     // gradient wrt to w_q, scales or biases
@@ -3679,13 +3680,15 @@ std::vector<array> QuantizedMatmul::jvp(
       group_size_,
       bits_,
       quantization_mode_to_string(mode_),
-      stream())};
+      stream(),
+      reference_prefill_)};
 }
 
 bool QuantizedMatmul::is_equivalent(const Primitive& other) const {
   const QuantizedMatmul& qm_other = static_cast<const QuantizedMatmul&>(other);
   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
-      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_;
+      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_ &&
+      reference_prefill_ == qm_other.reference_prefill_;
 }
 
 std::vector<Shape> QuantizedMatmul::output_shapes(

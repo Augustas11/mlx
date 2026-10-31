@@ -1172,6 +1172,7 @@ void qmm_splitk(
     int group_size,
     int bits,
     int M,
+    int split_m,
     int N,
     int K,
     metal::Device& d,
@@ -1181,7 +1182,8 @@ void qmm_splitk(
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
   int m_tiles = (M + bm - 1) / bm;
-  int current_tgs = n_tiles * m_tiles;
+  int split_m_tiles = (split_m + bm - 1) / bm;
+  int current_tgs = n_tiles * split_m_tiles;
   int split_k = std::max(1, 512 / current_tgs);
 
   // Each K partition must be a whole number of BK-wide (32) K-tiles as well as
@@ -1851,11 +1853,19 @@ void dispatch_qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool reference_prefill = false) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits) &&
       !global_scale) {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  // Flagged multi-token prefill follows the vendor route. Decode and ordinary
+  // primitives keep the batch-invariant qmv path below.
+  if (reference_prefill && M >= 2 && use_qmv_wide(mode, d) && !global_scale) {
+    qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
 
@@ -1904,8 +1914,33 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
+  bool reference_prefill =
+      reference_prefill_ && non_batched && transpose_ && x.ndim() >= 3 &&
+      x.shape(-2) > 1;
+  int route_m = reference_prefill ? x.shape(-2) : M;
   // It is a matrix matrix product.
-  if (M >= vector_limit) {
+  if (route_m >= vector_limit) {
+    // LFM2.5 opts into the vendor's split-K accumulation for multi-token
+    // prefill. Pick the split count from one row's sequence length so a
+    // shared B-row prefill reduces K exactly like B independent rows.
+    if (reference_prefill) {
+      qmm_splitk(
+          x,
+          w,
+          scales,
+          biases,
+          out,
+          group_size_,
+          bits_,
+          M,
+          x.shape(-2),
+          N,
+          K,
+          d,
+          s,
+          mode);
+      return;
+    }
     // macprovider: no qmm_splitk. Its split count follows the M tile count,
     // so the same row sums K in a different order when the call carries more
     // rows (a 2-row prefill chunk vs the 1-row serial chunk). qmm reduces K
@@ -1944,7 +1979,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         K,
         d,
         s,
-        mode);
+        mode,
+        reference_prefill);
     return;
   }
 
@@ -2165,7 +2201,8 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       K,
       d,
       s,
-      mode);
+      mode,
+      false);
 }
 
 void GatherQQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
