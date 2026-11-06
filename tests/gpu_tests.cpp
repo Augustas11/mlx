@@ -783,3 +783,63 @@ TEST_CASE("test layer norm vjp bias grad race") {
   }
   CHECK(worst <= 1e-5);
 }
+
+TEST_CASE("test gpu small-M quantized matmul batch invariance") {
+  // Continuous batching decodes a row alone and inside a batch of rows. Each
+  // row of a small-M affine product must equal the same row computed alone,
+  // bit for bit. The first three shapes take affine qmv_mma on non-NAX GPUs;
+  // the last (N < 512) stays on the vector route.
+  struct Shape {
+    int K;
+    int N;
+  };
+  const std::array<Shape, 4> shapes = {
+      Shape{2048, 1024}, Shape{4096, 4096}, Shape{512, 4096}, Shape{512, 256}};
+  const std::array<int, 5> batch_rows = {2, 3, 4, 8, 16};
+  const std::array<Dtype, 3> dtypes = {float16, bfloat16, float32};
+
+  random::seed(0);
+  for (auto [K, N] : shapes) {
+    for (int bits : {4, 8}) {
+      for (int gs : {32, 64, 128}) {
+        for (auto dtype : dtypes) {
+          auto x = astype(
+              random::normal({16, K}) / std::sqrt(static_cast<float>(K)),
+              dtype);
+          auto w = astype(random::normal({N, K}), dtype);
+          auto q = quantize(w, gs, bits);
+          auto qmm = [&](const array& v) {
+            return quantized_matmul(v, q[0], q[1], q[2], true, gs, bits);
+          };
+
+          std::vector<array> alone;
+          for (int i = 0; i < 16; ++i) {
+            alone.push_back(qmm(slice(x, {i, 0}, {i + 1, K})));
+          }
+          auto alone_all = concatenate(alone, 0);
+          eval(alone_all);
+
+          for (int M : batch_rows) {
+            CAPTURE(K);
+            CAPTURE(N);
+            CAPTURE(bits);
+            CAPTURE(gs);
+            CAPTURE(M);
+            CAPTURE(dtype);
+            auto expected = slice(alone_all, {0, 0}, {M, N});
+            auto rows = slice(x, {0, 0}, {M, K});
+            // [M, K] rows.
+            CHECK(array_equal(qmm(rows), expected).item<bool>());
+            // Decode rows as a [M, 1, K] batch.
+            auto out3 = reshape(qmm(reshape(rows, {M, 1, K})), {M, N});
+            CHECK(array_equal(out3, expected).item<bool>());
+            // Rows gathered with a stride (a non-contiguous x).
+            auto x2 = repeat(rows, 2, 0);
+            auto strided = slice(x2, {0, 0}, {2 * M, K}, {2, 1});
+            CHECK(array_equal(qmm(strided), expected).item<bool>());
+          }
+        }
+      }
+    }
+  }
+}

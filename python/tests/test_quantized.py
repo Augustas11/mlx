@@ -658,6 +658,58 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertLess((y_ref - y).abs().max(), 1e-3)
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_small_m_batch_invariant(self):
+        # Continuous batching needs every row of a small-M product to match the
+        # same row computed alone, bit for bit. The first three shapes take
+        # affine qmv_mma on non-NAX GPUs, the last stays on qmv (N < 512).
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        mx.random.seed(0)
+
+        def rel_err(got, expected):
+            d = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+            return d.max() / mx.abs(expected.astype(mx.float32)).max()
+
+        shapes = [
+            # K, N, row counts checked against the 1-row result
+            (2048, 1024, [2, 3, 4, 8, 16]),
+            (4096, 4096, [2, 3, 4, 8, 16]),
+            (512, 4096, [2, 3, 4, 8, 16]),
+            (512, 256, [2, 3, 4, 8]),
+        ]
+        for (K, N, Ms), bits, gs, dtype in product(
+            shapes,
+            [4, 8],
+            [32, 64],
+            [mx.float16, mx.bfloat16, mx.float32],
+        ):
+            x = (mx.random.normal((24, K)) / K**0.5).astype(dtype)
+            w = mx.random.normal((N, K)).astype(dtype)
+            w_q, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            w_hat = mx.dequantize(w_q, scales, biases, group_size=gs, bits=bits)
+
+            def qmm(v):
+                return mx.quantized_matmul(
+                    v, w_q, scales, biases, transpose=True, group_size=gs, bits=bits
+                )
+
+            alone = mx.concatenate([qmm(x[i : i + 1]) for i in range(16)])
+            tol = 1e-5 if dtype == mx.float32 else 3e-2
+            with self.subTest(K=K, N=N, M=1, bits=bits, gs=gs, dtype=dtype):
+                self.assertLess(rel_err(alone, x[:16] @ w_hat.T), tol)
+            for M in Ms:
+                with self.subTest(K=K, N=N, M=M, bits=bits, gs=gs, dtype=dtype):
+                    out = qmm(x[:M])
+                    self.assertTrue(mx.array_equal(out, alone[:M]).item())
+                    # Decode rows as a [rows, 1, K] batch.
+                    out3 = qmm(x[:M].reshape(M, 1, K)).reshape(M, N)
+                    self.assertTrue(mx.array_equal(out3, alone[:M]).item())
+            # 24 rows tile the qmv_mma grid twice where the qmm route starts
+            # above 24 rows, and take qmm elsewhere; either way it is accurate.
+            with self.subTest(K=K, N=N, M=24, bits=bits, gs=gs, dtype=dtype):
+                self.assertLess(rel_err(qmm(x), x @ w_hat.T), tol)
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_precision(self):
         # Split-K sums the partitions in float32 and rounds the result to the
         # input type once. Rounding each partition first gives two to three

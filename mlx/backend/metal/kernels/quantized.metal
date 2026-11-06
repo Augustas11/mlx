@@ -195,4 +195,33 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8)
 
-instantiate_quantized_all() // clang-format on
+instantiate_quantized_all()
+
+#define instantiate_qmv_mma(name, type, group_size, bits, wk, bn, tm) \
+  instantiate_kernel( \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_wk_" #wk "_bn_" #bn "_tm_" #tm, \
+      name,           \
+      type,           \
+      group_size,     \
+      bits,           \
+      wk,             \
+      bn,             \
+      tm)
+
+#define instantiate_qmv_mma_all(type, group_size, bits)               \
+  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, 4, 16, 1) \
+  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, 4, 16, 2) \
+  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, 4, 32, 1)
+
+#define instantiate_qmv_mma_types(group_size, bits)       \
+  instantiate_qmv_mma_all(float, group_size, bits)      \
+  instantiate_qmv_mma_all(float16_t, group_size, bits)  \
+  instantiate_qmv_mma_all(bfloat16_t, group_size, bits)
+
+#define instantiate_qmv_mma_groups(bits) \
+  instantiate_qmv_mma_types(128, bits)   \
+  instantiate_qmv_mma_types(64, bits)    \
+  instantiate_qmv_mma_types(32, bits)
+
+instantiate_qmv_mma_groups(4)
+instantiate_qmv_mma_groups(8) // clang-format on

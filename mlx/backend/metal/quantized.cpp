@@ -632,6 +632,97 @@ void qmv_wide(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// macprovider: affine qmv_mma (ml-explore/mlx#4787) for non-NAX GPUs. Every
+// test here reads the weight shape, type and device, never the row count M,
+// so a row takes the same kernel alone and inside a batch. Upstream starts at
+// 3 or 4 rows and keeps Ultra on qmv; both checks depend on M or would leave
+// the lab Mac on qmv, so they are dropped and M = 1 takes qmv_mma too.
+inline bool use_affine_qmv_mma(
+    const array& w,
+    const array& scales,
+    QuantizationMode mode,
+    int group_size,
+    int bits,
+    int N,
+    int K) {
+  if (mode != QuantizationMode::Affine || metal::is_nax_available()) {
+    return false;
+  }
+  if ((bits != 4 && bits != 8) ||
+      (group_size != 32 && group_size != 64 && group_size != 128)) {
+    return false;
+  }
+  if ((w.offset() % 16) || (scales.offset() % 2)) {
+    return false;
+  }
+  return (K % 128 == 0) && (N >= 512) && (K >= 512) &&
+      (int64_t(N) * K >= (int64_t(1) << 21)) && (N % 16 == 0);
+}
+
+void qmv_mma(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  // wk and the row tiling never change a row's K reduction order; tm and bn
+  // only pick how many rows and columns one threadgroup covers.
+  constexpr int wk = 4;
+  int tm = (M > 8) ? 2 : 1;
+  int bn = 16;
+  // Below gen 15, affine with one row tile is faster at 32 columns (M2 Pro).
+  if ((d.get_architecture_gen() < 15) && (tm == 1) && (N % 32 == 0)) {
+    bn = 32;
+  }
+
+  std::string type_string = get_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      mode,
+      "_qmv_mma_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_wk_",
+      wk,
+      "_bn_",
+      bn,
+      "_tm_",
+      tm);
+  auto kernel = get_quantized_kernel_wrapped(
+      d, kname, "qmv_mma", mode, type_string, group_size, bits, wk, bn, tm);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases) {
+    compute_encoder.set_input_array(*biases, c++);
+  }
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  int rows_per_tg = 8 * tm;
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(N / bn, (M + rows_per_tg - 1) / rows_per_tg, 1),
+      MTL::Size(32, wk, 1));
+}
+
 void qvm_split_k(
     array x,
     const array& w,
@@ -1918,6 +2009,27 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       reference_prefill_ && non_batched && transpose_ && x.ndim() >= 3 &&
       x.shape(-2) > 1;
   int route_m = reference_prefill ? x.shape(-2) : M;
+
+  // macprovider: rows below the qmm route take affine qmv_mma when the weight
+  // shape allows it, from 1 row up. The test reads no row count, and the row
+  // limit is at least 17 so 1..16 rows always match bit for bit (upstream
+  // also takes qmv_mma up to 16 rows ahead of the qmm route). An unaligned or
+  // non-contiguous x is copied rather than sent to qmv, so the route cannot
+  // follow how a caller sliced its rows.
+  if (transpose_ && !reference_prefill && w.ndim() == 2 && biases &&
+      use_affine_qmv_mma(w, scales, mode_, group_size_, bits_, N, K)) {
+    int rows = x.size() / K;
+    if (rows > 0 && rows < std::max(vector_limit, 17)) {
+      if (!x.flags().row_contiguous || (x.offset() % (8 * x.itemsize()))) {
+        x = contiguous_copy_gpu(x, s);
+        metal::get_command_encoder(s).add_temporary(x);
+      }
+      qmv_mma(
+          x, w, scales, biases, out, group_size_, bits_, rows, N, K, d, s, mode);
+      return;
+    }
+  }
+
   // It is a matrix matrix product.
   if (route_m >= vector_limit) {
     // LFM2.5 opts into the vendor's split-K accumulation for multi-token
