@@ -1963,17 +1963,21 @@ void dispatch_qmv(
   // macprovider: upstream sends M = 1 to qmv and 2 <= M < vector_limit to
   // qmv_wide. The two reduce a vector in different orders, so a row's bits
   // would follow how many rows share the call. Here every affine row count
-  // below the qmm route takes qmv_wide, M = 1 included, wherever qmv_wide
-  // beats qmv (the test reads the mode and device, never M). qmv_wide sums
-  // each vector in an order set by k_lanes and the weight group alone; the
-  // vector tile (vecs_per_tg) only decides how many vectors share one read of
-  // the weights, so a row matches its serial result while the weights are
-  // read once per tile of up to 5 rows instead of once per row.
-  // Gen 17 (M5) keeps every row count on qmv: there qmv_wide lost about a
-  // fifth of single-row Qwen3-8B decode speed to qmv. The gen test reads the
-  // device, never M.
+  // below the qmm route takes qmv_wide, M = 1 included, for the shapes where
+  // qmv_wide beats qmv. qmv_wide sums each vector in an order set by k_lanes
+  // and the weight group alone; the vector tile (vecs_per_tg) only decides
+  // how many vectors share one read of the weights, so a row matches its
+  // serial result while the weights are read once per tile of up to 5 rows
+  // instead of once per row.
+  // The route reads the weight shape and the device, never M:
+  // - K not a multiple of 128 (gpt-oss, K = 2880) only. Aligned-K shapes
+  //   that miss qmv_mma (N < 512) stay on qmv, where qmv_wide cost GLM-5-Next
+  //   0.7% of 4-row decode.
+  // - Gen 15 and 16 only. On gen 17 (M5) qmv_wide lost about a fifth of
+  //   single-row Qwen3-8B decode speed to qmv.
   int gen = d.get_architecture_gen();
-  if (mode == "affine" && gen >= 15 && gen <= 16 && biases && !global_scale) {
+  if (mode == "affine" && gen >= 15 && gen <= 16 && (K % 128) != 0 &&
+      biases && !global_scale) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
