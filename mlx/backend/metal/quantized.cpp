@@ -1969,7 +1969,11 @@ void dispatch_qmv(
   // vector tile (vecs_per_tg) only decides how many vectors share one read of
   // the weights, so a row matches its serial result while the weights are
   // read once per tile of up to 5 rows instead of once per row.
-  if (mode == "affine" && use_qmv_wide(mode, d) && biases && !global_scale) {
+  // Gen 17 (M5) keeps every row count on qmv: there qmv_wide lost about a
+  // fifth of single-row Qwen3-8B decode speed to qmv. The gen test reads the
+  // device, never M.
+  int gen = d.get_architecture_gen();
+  if (mode == "affine" && gen >= 15 && gen <= 16 && biases && !global_scale) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
