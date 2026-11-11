@@ -6,8 +6,11 @@
 #include "doctest/doctest.h"
 
 #include <cmath>
+#include <future>
 #include <limits>
+#include <thread>
 
+#include "mlx/compile_impl.h"
 #include "mlx/mlx.h"
 #include "mlx/primitives.h"
 
@@ -874,4 +877,46 @@ TEST_CASE("test compile throwing first trace does not poison cache") {
   auto out = cfun({});
   REQUIRE_EQ(out.size(), 1);
   CHECK_EQ(out[0].item<float>(), 3.0f);
+}
+
+TEST_CASE("test compile erase reaches every thread's cache") {
+  // The compile cache is per thread. A compiled function's traces live in
+  // the cache of each thread that called it, but compile_erase is handed one
+  // thread's cache (the one captured when the function was created, or the
+  // last caller's). A new function that reuses the id must not replay the
+  // erased function's trace on a thread that is still alive.
+  std::uintptr_t fun_id = 0x5eed;
+  auto add_one = [](const std::vector<array>& inputs) {
+    return std::vector<array>{inputs[0] + 1};
+  };
+  auto add_two = [](const std::vector<array>& inputs) {
+    return std::vector<array>{inputs[0] + 2};
+  };
+  auto first = detail::compile(add_one, fun_id);
+  std::function<std::vector<array>(const std::vector<array>&)> second;
+
+  std::promise<float> first_result, second_result;
+  std::promise<void> second_ready;
+  std::thread worker([&] {
+    auto x = array(1.0f);
+    // Create this thread's default stream first: cache entries are keyed by
+    // it, so the trace below must be stored under the stream later calls see.
+    eval(x + 0);
+    first_result.set_value(first({x})[0].item<float>());
+    second_ready.get_future().wait();
+    second_result.set_value(second({x})[0].item<float>());
+  });
+
+  CHECK_EQ(first_result.get_future().get(), 2.0f);
+
+  // Erase through this thread's cache while the worker still holds the trace.
+  detail::compile_erase(detail::compile_cache(), fun_id);
+  second = detail::compile(add_two, fun_id);
+  second_ready.set_value();
+
+  // A different function with the same id must be traced afresh.
+  CHECK_EQ(second_result.get_future().get(), 3.0f);
+  worker.join();
+
+  detail::compile_erase(detail::compile_cache(), fun_id);
 }
