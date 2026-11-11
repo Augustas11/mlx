@@ -195,6 +195,10 @@ inline bool enable_tf32() {
   return config::get("MLX_ENABLE_TF32", 1);
 }
 
+inline bool qmm_batch_invariant() {
+  return config::get("MLX_QMM_BATCH_INVARIANT", 0);
+}
+
 } // namespace env
 
 } // namespace mlx::core

@@ -1950,6 +1950,11 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
   const int row_scales = K / group_size;
 
   const int y_col = tid.x * BN;
+  // Grid y tiles the rows 8 * TM at a time. A row's reduction never reads
+  // another row, so its result does not depend on the tile it lands in.
+  const int r0 = tid.y * 8 * TM;
+  x += r0 * static_cast<int64_t>(K);
+  y += r0 * static_cast<int64_t>(N);
   auto wl = (const device uint8_t*)w +
       (y_col + fm) * static_cast<int64_t>(row_bytes) + 16 * fn / pack_factor;
   const int64_t s_off =
@@ -1964,7 +1969,7 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
   for (short mt = 0; mt < TM; mt++) {
     STEEL_PRAGMA_UNROLL
     for (short j = 0; j < 2; j++) {
-      x_rows[mt][j] = 8 * mt + fn + j < M;
+      x_rows[mt][j] = r0 + 8 * mt + fn + j < M;
     }
     STEEL_PRAGMA_UNROLL
     for (short t = 0; t < TN; t++) {

@@ -540,8 +540,10 @@ void qmv(
 }
 
 // affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen.
+// MLX_QMM_BATCH_INVARIANT turns it off, because only M >= 2 takes it.
 inline bool use_qmv_wide(const std::string& mode, metal::Device& d) {
-  return mode != "affine" || d.get_architecture_gen() >= 15;
+  return !env::qmm_batch_invariant() &&
+      (mode != "affine" || d.get_architecture_gen() >= 15);
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -693,6 +695,26 @@ inline bool use_qmv_mma(
   }
 }
 
+// The MLX_QMM_BATCH_INVARIANT route: affine weights on non-NAX GPUs take
+// qmv_mma at every row count below the qmm route. Nothing here reads M, so a
+// row gets the same kernel alone and inside a batch. The caller aligns x.
+inline bool use_qmv_mma_batch_invariant(
+    const array& w,
+    const array& scales,
+    QuantizationMode mode,
+    int bits,
+    int N,
+    int K) {
+  if (mode != QuantizationMode::Affine || metal::is_nax_available()) {
+    return false;
+  }
+  if ((w.offset() % 16) || (scales.offset() % 2)) {
+    return false;
+  }
+  return (bits == 4 || bits == 8) && (K % 128 == 0) && (N >= 512) &&
+      (K >= 512) && (int64_t(N) * K >= (int64_t(1) << 21)) && (N % 16 == 0);
+}
+
 void qmv_mma(
     const array& x,
     const array& w,
@@ -766,8 +788,11 @@ void qmv_mma(
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(M, c++);
+  // qmv_mma covers 8 * tm rows per threadgroup and tiles more rows over grid
+  // y (only the batch-invariant route sends it more than 16).
+  int row_tiles = nax ? 1 : (M + 8 * tm - 1) / (8 * tm);
   compute_encoder.dispatch_threadgroups(
-      MTL::Size(N / bn, 1, 1), MTL::Size(32, wk, 1));
+      MTL::Size(N / bn, row_tiles, 1), MTL::Size(32, wk, 1));
 }
 
 void qvm_splitk(
@@ -2210,17 +2235,36 @@ void dispatch_qmm_t(
     QuantizationMode qmode) {
   int vector_limit = get_qmv_batch_limit(K, N, d);
   auto mode = quantization_mode_to_string(qmode);
+  bool batch_invariant = env::qmm_batch_invariant();
 
-  // For few rows use qmv_mma when N/K is large enough.
-  if (non_batched && (M <= 16) &&
+  // With MLX_QMM_BATCH_INVARIANT set, every row count below the qmm route
+  // takes the same kernel: qmv_mma when the weights allow it, otherwise qmv
+  // (qmv_wide is off). A row's result then does not depend on how many rows
+  // share the call.
+  if (batch_invariant) {
+    if (non_batched && (M < vector_limit) &&
+        use_qmv_mma_batch_invariant(w, scales, qmode, bits, N, K)) {
+      // qmv_mma loads x in aligned vectors, so copy an unaligned x.
+      array xa = x;
+      if (x.offset() % (8 * x.itemsize())) {
+        xa = contiguous_copy_gpu(x, s);
+        metal::get_command_encoder(s).add_temporary(xa);
+      }
+      qmv_mma(
+          xa, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+      return;
+    }
+  } else if (
+      non_batched && (M <= 16) &&
       use_qmv_mma(x, w, scales, qmode, group_size, bits, M, N, K, d)) {
+    // For few rows use qmv_mma when N/K is large enough.
     qmv_mma(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
 
   // For mid rows use NAX qmm when output is large enough.
-  if (non_batched && (M >= 8) && (M < vector_limit) && (M * N >= 16384) &&
-      use_qmm_nax_splitk(x, M, N, K, group_size)) {
+  if (!batch_invariant && non_batched && (M >= 8) && (M < vector_limit) &&
+      (M * N >= 16384) && use_qmm_nax_splitk(x, M, N, K, group_size)) {
     qmm_splitk_nax(
         x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
@@ -2284,6 +2328,14 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   std::optional<array> biases = std::nullopt;
   if (inputs.size() == 4) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
+  }
+
+  // The batch-invariant route has to see all rows of x as one matrix, so x
+  // with strided batch dimensions is copied instead of taking batched qmv.
+  if (transpose_ && (w.ndim() == 2) && !x.flags().row_contiguous &&
+      env::qmm_batch_invariant()) {
+    x = contiguous_copy_gpu(x, s);
+    metal::get_command_encoder(s).add_temporary(x);
   }
 
   // Extract the matmul shapes

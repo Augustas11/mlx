@@ -949,6 +949,60 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 )
                 self.assertLess(rel_err(out, y_ref), tol)
 
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_batch_invariant(self):
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        mx.random.seed(0)
+
+        def rel_err(got, expected):
+            d = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+            return d.max() / mx.abs(expected.astype(mx.float32)).max()
+
+        # Row counts stay below the smallest qmm threshold for each shape.
+        # Ultra GPUs keep up to 31 rows on the vector route at K, N <= 2048,
+        # which also covers qmv_mma's row tiling above 16 rows.
+        ultra = mx.device_info(mx.gpu)["architecture"].endswith("d")
+        shapes = [
+            (2048, 1024, [2, 3, 4, 8, 9, 12] + ([17, 24, 31] if ultra else [])),
+            (4096, 4096, [2, 3, 4, 8, 9]),
+            (512, 4096, [2, 3, 4, 8, 9]),  # smallest K
+            (512, 256, [2, 3, 4, 8, 9]),  # N < 512 stays on qmv
+        ]
+        for (K, N, Ms), bits, gs, dtype in product(
+            shapes,
+            [4, 8],
+            [32, 64, 128],
+            [mx.bfloat16, mx.float16, mx.float32],
+        ):
+            x = (mx.random.normal((32, K)) / K**0.5).astype(dtype)
+            w = mx.random.normal((N, K), dtype=dtype)
+            w_q, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            w_hat = mx.dequantize(w_q, scales, biases, group_size=gs, bits=bits)
+
+            def qmm(v):
+                return mx.quantized_matmul(
+                    v, w_q, scales, biases, group_size=gs, bits=bits
+                )
+
+            with mx.config.scoped_update(MLX_QMM_BATCH_INVARIANT=1):
+                rows = max(Ms)
+                alone = mx.concatenate([qmm(x[i : i + 1]) for i in range(rows)])
+                tol = 1e-5 if dtype == mx.float32 else 3e-2
+                with self.subTest(K=K, N=N, bits=bits, gs=gs, dtype=dtype):
+                    self.assertLess(rel_err(alone, x[:rows] @ w_hat.T), tol)
+                for M in Ms:
+                    with self.subTest(K=K, N=N, M=M, bits=bits, gs=gs, dtype=dtype):
+                        out = qmm(x[:M])
+                        self.assertTrue(mx.array_equal(out, alone[:M]).item())
+                        # Decode rows as a [M, 1, K] batch
+                        out = qmm(x[:M, None]).squeeze(1)
+                        self.assertTrue(mx.array_equal(out, alone[:M]).item())
+                        # A [M, 1, K] batch with a batch stride of 2 * K
+                        xs = mx.repeat(x[:M, None], 2, axis=0)[::2]
+                        out = qmm(xs).squeeze(1)
+                        self.assertTrue(mx.array_equal(out, alone[:M]).item())
+
     def test_qmm_vjp(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)

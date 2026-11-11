@@ -28,6 +28,15 @@ General
    on supported hardware. The default is ``1``. Set it to ``0`` to keep these
    operations in full ``float32`` precision. See :doc:`precision`.
 
+.. envvar:: MLX_QMM_BATCH_INVARIANT
+
+   Make each row of a Metal :func:`quantized_matmul` with few rows independent
+   of how many rows share the call. Every row count below the matrix-kernel
+   threshold then takes the same kernel, so a row computed alone and the same
+   row inside a batch give identical results. This is useful when batching
+   decode requests must not change their outputs. The default is ``0``. It
+   can cost speed for some row counts.
+
 Distributed
 -----------
 
