@@ -133,13 +133,15 @@
   instantiate_quantized_quad(affine_qmv_quad, type, group_size, bits, 128, 1)  \
   instantiate_quantized_quad(affine_qmv_quad, type, group_size, bits, 128, 0)
 
-// vecs_per_tg (input-vector tile) 2..5; affine uses k_lanes=8 (more rows per
-// simdgroup) where the fp path uses 16.
+// vecs_per_tg (input-vector tile) 1..5 (1 serves single-row decode on the
+// batch-invariant route); affine uses k_lanes=8 (more rows per simdgroup)
+// where the fp path uses 16.
 #define instantiate_quantized_wide_wrap(name, type, group_size, bits, vecs_per_tg, k_lanes) \
   instantiate_quantized_wide(name, type, group_size, bits, vecs_per_tg, k_lanes, 0)         \
   instantiate_quantized_wide(name, type, group_size, bits, vecs_per_tg, k_lanes, 1)
 
 #define instantiate_quantized_all_wide(type, group_size, bits) \
+  instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 1, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 2, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 3, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 4, 8) \

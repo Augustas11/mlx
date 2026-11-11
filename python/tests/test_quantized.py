@@ -661,7 +661,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
     def test_qmm_small_m_batch_invariant(self):
         # Continuous batching needs every row of a small-M product to match the
         # same row computed alone, bit for bit. The first three shapes take
-        # affine qmv_mma on non-NAX GPUs, the last stays on qmv (N < 512).
+        # affine qmv_mma on non-NAX GPUs. The rest miss qmv_mma (N < 512, or
+        # K = 2880 is not a multiple of 128, as in gpt-oss) and take qmv_wide on
+        # gen-15+ GPUs and qmv elsewhere; their row counts stay below the qmm
+        # route on every device (at least 10 rows) and cover one and two
+        # qmv_wide vector tiles.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
         mx.random.seed(0)
@@ -676,6 +680,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
             (4096, 4096, [2, 3, 4, 8, 16]),
             (512, 4096, [2, 3, 4, 8, 16]),
             (512, 256, [2, 3, 4, 8]),
+            (2880, 4096, [2, 3, 4, 5, 6, 8, 9]),
+            (2880, 512, [2, 3, 4, 5, 6, 8, 9]),
         ]
         for (K, N, Ms), bits, gs, dtype in product(
             shapes,

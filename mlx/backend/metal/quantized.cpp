@@ -1960,11 +1960,20 @@ void dispatch_qmv(
     return;
   }
 
-  // macprovider: no qmv_wide. It reduces each vector in a different order
-  // from qmv, so a row's result would depend on how many rows share the call
-  // (M = 1 takes qmv, 2 <= M < vector_limit takes qmv_wide). Continuous
-  // batching needs every row to match its serial M = 1 result exactly, so
-  // every small-M product stays on qmv, as in MLX 0.31.
+  // macprovider: upstream sends M = 1 to qmv and 2 <= M < vector_limit to
+  // qmv_wide. The two reduce a vector in different orders, so a row's bits
+  // would follow how many rows share the call. Here every affine row count
+  // below the qmm route takes qmv_wide, M = 1 included, wherever qmv_wide
+  // beats qmv (the test reads the mode and device, never M). qmv_wide sums
+  // each vector in an order set by k_lanes and the weight group alone; the
+  // vector tile (vecs_per_tg) only decides how many vectors share one read of
+  // the weights, so a row matches its serial result while the weights are
+  // read once per tile of up to 5 rows instead of once per row.
+  if (mode == "affine" && use_qmv_wide(mode, d) && biases && !global_scale) {
+    qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
   qmv(x,
       w,
       scales,
