@@ -637,6 +637,16 @@ void qmv_wide(
 // so a row takes the same kernel alone and inside a batch. Upstream starts at
 // 3 or 4 rows and keeps Ultra on qmv; both checks depend on M or would leave
 // the lab Mac on qmv, so they are dropped and M = 1 takes qmv_mma too.
+// LAB ONLY (never tagged): MLX_LAB_QROUTE=mma|qmm forces the route of a
+// transposed affine non-prefill product so one build can time each kernel.
+inline const std::string& lab_qroute() {
+  static const std::string v = [] {
+    const char* e = std::getenv("MLX_LAB_QROUTE");
+    return std::string(e ? e : "");
+  }();
+  return v;
+}
+
 inline bool use_affine_qmv_mma(
     const array& w,
     const array& scales,
@@ -645,7 +655,8 @@ inline bool use_affine_qmv_mma(
     int bits,
     int N,
     int K) {
-  if (mode != QuantizationMode::Affine || metal::is_nax_available()) {
+  if (mode != QuantizationMode::Affine ||
+      (metal::is_nax_available() && lab_qroute() != "mma")) {
     return false;
   }
   if ((bits != 4 && bits != 8) ||
@@ -2045,6 +2056,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           x, w, scales, biases, out, group_size_, bits_, rows, N, K, d, s, mode);
       return;
     }
+  }
+
+  if (transpose_ && !reference_prefill && lab_qroute() == "qmm") {
+    qmm(x, w, scales, biases, std::nullopt, out, transpose_, group_size_,
+        bits_, M, N, K, d, s, mode);
+    return;
   }
 
   // It is a matrix matrix product.
