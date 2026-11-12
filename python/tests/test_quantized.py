@@ -664,8 +664,10 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # affine qmv_mma on non-NAX GPUs. (512, 256) misses qmv_mma (N < 512)
         # and takes qmv. The K = 2880 shapes (not a multiple of 128, as in
         # gpt-oss, router included) take qmv_wide on gen 15 and 16 GPUs and qmv
-        # elsewhere; their row counts stay below the qmm route on every device
-        # (at least 10 rows) and cover one and two qmv_wide vector tiles.
+        # elsewhere; they cover one and two qmv_wide vector tiles. (512, 16384)
+        # has a 12 or 13-row device limit on gen 17 and Ultra; 13..16 rows must
+        # stay on the vector route there too. Transposed products keep 1..16
+        # rows off the qmm route on every device.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
         mx.random.seed(0)
@@ -683,6 +685,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
             (2880, 4096, [2, 3, 4, 5, 6, 8, 9]),
             (2880, 512, [2, 3, 4, 5, 6, 8, 9]),
             (2880, 32, [2, 3, 4, 5, 6, 8, 9]),
+            (512, 16384, [2, 3, 4, 8, 12, 13, 16]),
         ]
         for (K, N, Ms), bits, gs, dtype in product(
             shapes,

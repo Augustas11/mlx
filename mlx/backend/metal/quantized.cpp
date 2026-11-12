@@ -2048,7 +2048,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   // It is a matrix matrix product.
-  if (route_m >= vector_limit) {
+  // macprovider: a transposed product keeps 1..16 rows on the vector route on
+  // every device, as qmv_mma does above. The device row limit can be 12 or 13
+  // for large shapes (gen 17, Ultra), and qmm, qmm_nax on NAX GPUs, reduces K
+  // in another order than qmv, so a 13..16-row decode step would change a
+  // row's bits against its 1-row result. Flagged multi-token prefill keeps the
+  // vendor limit.
+  int matrix_m = (transpose_ && !reference_prefill)
+      ? std::max(vector_limit, 17)
+      : vector_limit;
+  if (route_m >= matrix_m) {
     // LFM2.5 opts into the vendor's split-K accumulation for multi-token
     // prefill. Pick the split count from one row's sequence length so a
     // shared B-row prefill reduces K exactly like B independent rows.
