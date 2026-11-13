@@ -650,6 +650,20 @@ inline bool use_affine_qmv_mma(
   if (mode != QuantizationMode::Affine || metal::is_nax_available()) {
     return false;
   }
+  // macprovider: the row-invariant window exists so a row decodes to the same
+  // bits alone and inside a batch. A process that never puts two decode rows
+  // in one product for its whole lifetime does not need it and can start with
+  // MLX_METAL_SMALL_M_ROW_INVARIANT=0 to take the per-row qmv / qmm route
+  // below, which is what upstream runs and is faster at one row. The default
+  // keeps the window, so leaving the variable unset can cost speed, never a
+  // row's bits. Read once, at the first product that reaches this test: a
+  // route that could change inside a process would let state computed on one
+  // route continue on the other.
+  static const bool row_invariant =
+      env::get_var("MLX_METAL_SMALL_M_ROW_INVARIANT", 1) != 0;
+  if (!row_invariant) {
+    return false;
+  }
   if ((bits != 4 && bits != 8) ||
       (group_size != 32 && group_size != 64 && group_size != 128)) {
     return false;

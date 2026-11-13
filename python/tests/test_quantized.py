@@ -4,6 +4,7 @@ import math
 import os
 import platform
 import subprocess
+import sys
 import unittest
 from itertools import product
 
@@ -823,6 +824,86 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 "NAX GPU: the qmv_mma1 / qmv_mma route is off, these rows all "
                 "took qmv; qmv_mma1 against qmv_mma was NOT compared here"
             )
+
+    def test_qmm_small_m_row_invariant_switch(self):
+        # MLX_METAL_SMALL_M_ROW_INVARIANT=0 turns the row-invariant window
+        # (qmv_mma1 / qmv_mma) off for a process that never batches decode
+        # rows: 1 to 16 rows then take the per-row qmv / qmm route, as before
+        # the window existed. The variable is read once per process, so each
+        # setting runs in its own interpreter.
+        #
+        # Checked: with "0" a row gives the same bits alone and inside 2, 4
+        # and 8 rows (all below the smallest qmv row limit, so per-row qmv on
+        # every GPU); unset and "1" give the same bits as each other; a
+        # process that sets "0" after its first product keeps the window.
+        # 16 rows are computed in every run but only compared with the single
+        # row where they take the same kernel: with the window on.
+        #
+        # On NAX GPUs the window is off either way and both settings take qmv;
+        # the test then reports itself as skipped.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        child = r"""
+import hashlib, os, sys
+import mlx.core as mx
+late = sys.argv[1] == "late"
+mx.random.seed(1)
+K, N, bits, gs = 4096, 4096, 4, 64
+w_shape = (N, K * bits // 32)
+w_q = mx.bitwise_or(
+    mx.left_shift(mx.random.randint(0, 1 << 16, w_shape).astype(mx.uint32), 16),
+    mx.random.randint(0, 1 << 16, w_shape).astype(mx.uint32),
+)
+s_shape = (N, K // gs)
+scales = mx.random.uniform(-1.0, 1.0, s_shape) * 0.03
+biases = mx.random.uniform(-1.0, 1.0, s_shape) * 0.2
+x = mx.random.uniform(-1.0, 1.0, (16, K)) * mx.power(
+    2.0, mx.random.randint(-8, 3, (16, K)).astype(mx.float32)
+)
+mx.eval(w_q, scales, biases, x)
+def row0(M):
+    out = mx.quantized_matmul(
+        x[0:M], w_q, scales, biases, transpose=True, group_size=gs, bits=bits
+    )
+    out = mx.view(out[0:1], mx.uint32)
+    mx.eval(out)
+    return hashlib.sha256(bytes(memoryview(out))).hexdigest()
+first = row0(1)
+if late:
+    os.environ["MLX_METAL_SMALL_M_ROW_INVARIANT"] = "0"
+print(" ".join([first] + [row0(M) for M in (1, 2, 4, 8, 16)]))
+"""
+
+        def run(value, mode="plain"):
+            env = dict(os.environ)
+            env.pop("MLX_METAL_SMALL_M_ROW_INVARIANT", None)
+            if value is not None:
+                env["MLX_METAL_SMALL_M_ROW_INVARIANT"] = value
+            out = subprocess.run(
+                [sys.executable, "-c", child, mode],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return out.stdout.split()
+
+        unset = run(None)
+        on = run("1")
+        off = run("0")
+        late = run(None, "late")
+        # Window off: per-row qmv for 1, 2, 4 and 8 rows.
+        self.assertEqual(len(set(off[:5])), 1)
+        self.assertEqual(unset, on)
+        if off[0] == unset[0]:
+            self.skipTest(
+                "The switch changed no bits: the row-invariant window is off on "
+                "this GPU (NAX), so the two settings were NOT told apart here"
+            )
+        # Window on: one reduction order for 1 to 16 rows.
+        self.assertEqual(len(set(unset)), 1)
+        # Read once: setting "0" after the first product changes nothing.
+        self.assertEqual(late, unset)
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_precision(self):
