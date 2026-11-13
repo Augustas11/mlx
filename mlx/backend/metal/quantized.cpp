@@ -742,9 +742,11 @@ void qmv_mma(
 // macprovider: rows up to this count take qmv_mma1, more rows take qmv_mma.
 // This is a speed choice only: the two kernels give the same bits for a row
 // (see affine_qmv_mma1 in kernels/quantized.h), so moving the switch point
-// changes no result. Measured on an M3 Ultra with Llama 3.1 8B 4-bit: the
-// per-row kernels are ahead at 1 and 2 rows, qmv_mma from 3 rows up.
-constexpr int qmv_mma1_max_rows = 2;
+// changes no result. qmv_mma1 pays for every row and qmv_mma shares one read
+// of the weights across its rows. Measured on an M3 Ultra with Llama 3.1 8B
+// 4-bit, aggregate tok/s: 1 row 93 on qmv_mma1 against 75 on qmv_mma; 2 rows
+// 120 on qmv_mma1 against 146 on qmv_mma.
+constexpr int qmv_mma1_max_rows = 1;
 
 // One threadgroup per 8 output columns of one row; the grid height is the
 // row count. Any M works since a row never reads another row.
@@ -2093,8 +2095,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // macprovider: rows below the qmm route take the qmv_mma reduction when the
   // weight shape qualifies, from 1 row up: four partial sums over 128-wide K
   // blocks, added in one fixed order. That is the one reduction order of the
-  // whole window, and two kernels implement it: qmv_mma1 for 1 and 2 rows and
-  // qmv_mma (ml-explore/mlx#4787) for 3 rows and more. Both give the same bits
+  // whole window, and two kernels implement it: qmv_mma1 for 1 row and
+  // qmv_mma (ml-explore/mlx#4787) for 2 rows and more. Both give the same bits
   // for a row, so a row's result does not depend on how many rows share the
   // call, and the switch point is a speed choice (qmv_mma1_max_rows). The
   // weight test reads no row count, and the row limit is at least 17 so 1..16

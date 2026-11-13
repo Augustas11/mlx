@@ -663,8 +663,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # Continuous batching needs every row of a small-M product to match the
         # same row computed alone, bit for bit. On non-NAX GPUs the first three
         # shapes take the qmv_mma reduction up to 16 rows: the row computed
-        # alone and the 2-row batch run qmv_mma1, the batches of 3 to 16 rows
-        # run qmv_mma, and the two kernels must give the same bits. (512, 256)
+        # alone runs qmv_mma1, the batches of 2 to 16 rows run qmv_mma, and
+        # the two kernels must give the same bits. (512, 256)
         # misses that window (N < 512) and takes qmv below the qmm route. The
         # K = 2880 shapes (not a multiple of 128, as in gpt-oss, router
         # included) take qmv_wide on gen 15 and 16 GPUs and qmv elsewhere;
@@ -723,13 +723,12 @@ class TestQuantized(mlx_tests.MLXTestCase):
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_small_m_mma1_bit_equal(self):
         # On non-NAX GPUs a qualifying affine weight (4 or 8 bits, K a multiple
-        # of 128, N and K at least 512) sends 1 and 2 rows to qmv_mma1 and 3 to
-        # 16 rows to qmv_mma. The two kernels must run the same float32
-        # operations in the same order, so a row computed alone (qmv_mma1), in
-        # a pair (qmv_mma1) and inside batches of 3, 4, 8 (qmv_mma, one 8-row
-        # tile) and 9 rows (qmv_mma, two 8-row tiles) has to come out with the
-        # same bits. The comparison is on the raw bits, so it also tells +0
-        # from -0.
+        # of 128, N and K at least 512) sends 1 row to qmv_mma1 and 2 to 16
+        # rows to qmv_mma. The two kernels must run the same float32
+        # operations in the same order, so a row computed alone (qmv_mma1) and
+        # inside batches of 2, 3, 4, 8 (qmv_mma, one 8-row tile) and 9 rows
+        # (qmv_mma, two 8-row tiles) has to come out with the same bits. The
+        # comparison is on the raw bits, so it also tells +0 from -0.
         #
         # The weights are random bits with random scales and biases rather
         # than a quantized matrix, so every code value occurs. "model" data
