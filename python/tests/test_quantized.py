@@ -660,12 +660,13 @@ class TestQuantized(mlx_tests.MLXTestCase):
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_small_m_batch_invariant(self):
         # Continuous batching needs every row of a small-M product to match the
-        # same row computed alone, bit for bit. The first three shapes take
-        # affine qmv_mma on non-NAX GPUs. (512, 256) misses qmv_mma (N < 512)
-        # and takes qmv. The K = 2880 shapes (not a multiple of 128, as in
-        # gpt-oss, router included) take qmv_wide on gen 15 and 16 GPUs and qmv
-        # elsewhere; their row counts stay below the qmm route on every device
-        # (at least 10 rows) and cover one and two qmv_wide vector tiles.
+        # same row computed alone, bit for bit. The first three shapes take the
+        # per-row qmv kernel up to 16 rows on non-NAX GPUs. (512, 256) misses
+        # that window (N < 512) and takes qmv below the qmm route. The K = 2880
+        # shapes (not a multiple of 128, as in gpt-oss, router included) take
+        # qmv_wide on gen 15 and 16 GPUs and qmv elsewhere; their row counts
+        # stay below the qmm route on every device (at least 10 rows) and cover
+        # one and two qmv_wide vector tiles.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
         mx.random.seed(0)
@@ -711,8 +712,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     # Decode rows as a [rows, 1, K] batch.
                     out3 = qmm(x[:M].reshape(M, 1, K)).reshape(M, N)
                     self.assertTrue(mx.array_equal(out3, alone[:M]).item())
-            # 24 rows tile the qmv_mma grid twice where the qmm route starts
-            # above 24 rows, and take qmm elsewhere; either way it is accurate.
+            # 24 rows take qmv where the qmm route starts above 24 rows, and
+            # qmm elsewhere; either way it is accurate.
             with self.subTest(K=K, N=N, M=24, bits=bits, gs=gs, dtype=dtype):
                 self.assertLess(rel_err(qmm(x), x @ w_hat.T), tol)
 
