@@ -226,4 +226,17 @@ instantiate_quantized_all()
   instantiate_qmv_mma_types(32, bits)
 
 instantiate_qmv_mma_groups(4)
-instantiate_qmv_mma_groups(8) // clang-format on
+instantiate_qmv_mma_groups(8)
+
+#define instantiate_qmv_mma1_types(group_size, bits)                    \
+  instantiate_quantized(affine_qmv_mma1, float, group_size, bits)      \
+  instantiate_quantized(affine_qmv_mma1, float16_t, group_size, bits)  \
+  instantiate_quantized(affine_qmv_mma1, bfloat16_t, group_size, bits)
+
+#define instantiate_qmv_mma1_groups(bits) \
+  instantiate_qmv_mma1_types(128, bits)   \
+  instantiate_qmv_mma1_types(64, bits)    \
+  instantiate_qmv_mma1_types(32, bits)
+
+instantiate_qmv_mma1_groups(4)
+instantiate_qmv_mma1_groups(8) // clang-format on

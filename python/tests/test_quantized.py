@@ -660,13 +660,15 @@ class TestQuantized(mlx_tests.MLXTestCase):
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_small_m_batch_invariant(self):
         # Continuous batching needs every row of a small-M product to match the
-        # same row computed alone, bit for bit. The first three shapes take the
-        # per-row qmv kernel up to 16 rows on non-NAX GPUs. (512, 256) misses
-        # that window (N < 512) and takes qmv below the qmm route. The K = 2880
-        # shapes (not a multiple of 128, as in gpt-oss, router included) take
-        # qmv_wide on gen 15 and 16 GPUs and qmv elsewhere; their row counts
-        # stay below the qmm route on every device (at least 10 rows) and cover
-        # one and two qmv_wide vector tiles.
+        # same row computed alone, bit for bit. On non-NAX GPUs the first three
+        # shapes take the qmv_mma reduction up to 16 rows: the row computed
+        # alone and the 2-row batch run qmv_mma1, the batches of 3 to 16 rows
+        # run qmv_mma, and the two kernels must give the same bits. (512, 256)
+        # misses that window (N < 512) and takes qmv below the qmm route. The
+        # K = 2880 shapes (not a multiple of 128, as in gpt-oss, router
+        # included) take qmv_wide on gen 15 and 16 GPUs and qmv elsewhere;
+        # their row counts stay below the qmm route on every device (at least
+        # 10 rows) and cover one and two qmv_wide vector tiles.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
         mx.random.seed(0)
@@ -712,10 +714,115 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     # Decode rows as a [rows, 1, K] batch.
                     out3 = qmm(x[:M].reshape(M, 1, K)).reshape(M, N)
                     self.assertTrue(mx.array_equal(out3, alone[:M]).item())
-            # 24 rows take qmv where the qmm route starts above 24 rows, and
-            # qmm elsewhere; either way it is accurate.
+            # 24 rows tile the qmv_mma grid twice where the qmm route starts
+            # above 24 rows, and take qmm elsewhere; either way it is accurate.
             with self.subTest(K=K, N=N, M=24, bits=bits, gs=gs, dtype=dtype):
                 self.assertLess(rel_err(qmm(x), x @ w_hat.T), tol)
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_small_m_mma1_bit_equal(self):
+        # On non-NAX GPUs a qualifying affine weight (4 or 8 bits, K a multiple
+        # of 128, N and K at least 512) sends 1 and 2 rows to qmv_mma1 and 3 to
+        # 16 rows to qmv_mma. The two kernels must run the same float32
+        # operations in the same order, so a row computed alone (qmv_mma1), in
+        # a pair (qmv_mma1) and inside batches of 3, 4, 8 (qmv_mma, one 8-row
+        # tile) and 9 rows (qmv_mma, two 8-row tiles) has to come out with the
+        # same bits. The comparison is on the raw bits, so it also tells +0
+        # from -0.
+        #
+        # The weights are random bits with random scales and biases rather
+        # than a quantized matrix, so every code value occurs. "model" data
+        # looks like a quantized layer (small scales, bias near -scale * 2^(bits
+        # - 1), unit x with outliers); "wide" data spreads scales, biases and x
+        # over about ten binades each, where a different summation order shows
+        # up in most elements.
+        #
+        # 1664 = 13 * 128, so the four partial sums cover 4, 3, 3 and 3 K
+        # blocks.
+        #
+        # On NAX GPUs the route is off and all these row counts take qmv. The
+        # assertions still run there, but they compare qmv with itself and
+        # say nothing about qmv_mma1 against qmv_mma; the test then reports
+        # itself as skipped instead of passed.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        mx.random.seed(0)
+
+        def nax_available():
+            # Mirrors metal::is_nax_available() in mlx/backend/metal/device.cpp
+            # (gen 17 and up, gen 18 and up for "p" GPUs, on macOS 26.2 and
+            # up). A build with MLX_METAL_NO_NAX keeps the route on where this
+            # returns True; the assertions below ran either way.
+            arch = mx.device_info().get("architecture", "")
+            digits = "".join(ch for ch in arch.split("_g")[-1] if ch.isdigit())
+            if not digits:
+                return False
+            gen = int(digits)
+            release = tuple(int(v) for v in platform.mac_ver()[0].split(".")[:2])
+            return release >= (26, 2) and gen >= (18 if arch[-1] == "p" else 17)
+
+        def sym(shape):
+            return mx.random.uniform(-1.0, 1.0, shape)
+
+        def pow2(lo, hi, shape):
+            return mx.power(2.0, mx.random.randint(lo, hi, shape).astype(mx.float32))
+
+        def bits_of(a):
+            return mx.view(a, mx.uint32 if a.dtype == mx.float32 else mx.uint16)
+
+        rows = 9
+        for (K, N), bits, gs, dtype, kind in product(
+            [(4096, 4096), (4096, 1024), (1664, 2048)],
+            [4, 8],
+            [32, 64, 128],
+            [mx.float32, mx.float16, mx.bfloat16],
+            ["model", "wide"],
+        ):
+            w_shape = (N, K * bits // 32)
+            w_q = mx.bitwise_or(
+                mx.left_shift(
+                    mx.random.randint(0, 1 << 16, w_shape).astype(mx.uint32), 16
+                ),
+                mx.random.randint(0, 1 << 16, w_shape).astype(mx.uint32),
+            )
+            s_shape = (N, K // gs)
+            if kind == "model":
+                scales = (0.002 + 0.03 * mx.random.uniform(shape=s_shape)) * mx.where(
+                    mx.random.uniform(shape=s_shape) < 0.5, -1.0, 1.0
+                )
+                mid = 1 << (bits - 1)
+                biases = -scales * mid * (0.5 + mx.random.uniform(shape=s_shape))
+                x = (sym((rows, K)) + sym((rows, K)) + sym((rows, K))) * mx.where(
+                    mx.random.uniform(shape=(rows, K)) < 1 / 64, 16.0, 1.0
+                )
+            else:
+                scales = sym(s_shape) * pow2(-14, -4, s_shape)
+                biases = sym(s_shape) * pow2(-10, 1, s_shape)
+                x = sym((rows, K)) * pow2(-8, 3, (rows, K))
+            scales = scales.astype(dtype)
+            biases = biases.astype(dtype)
+            x = x.astype(dtype)
+            mx.eval(w_q, scales, biases, x)
+
+            def qmm(v):
+                return mx.quantized_matmul(
+                    v, w_q, scales, biases, transpose=True, group_size=gs, bits=bits
+                )
+
+            alone = bits_of(mx.concatenate([qmm(x[i : i + 1]) for i in range(rows)]))
+            # (first row, row count): pairs at two positions, then batches.
+            for i, M in [(0, 2), (7, 2), (0, 3), (0, 4), (5, 4), (0, 8), (0, 9)]:
+                with self.subTest(
+                    K=K, N=N, bits=bits, gs=gs, dtype=dtype, kind=kind, i=i, M=M
+                ):
+                    out = bits_of(qmm(x[i : i + M]))
+                    self.assertTrue(mx.array_equal(out, alone[i : i + M]).item())
+
+        if nax_available():
+            self.skipTest(
+                "NAX GPU: the qmv_mma1 / qmv_mma route is off, these rows all "
+                "took qmv; qmv_mma1 against qmv_mma was NOT compared here"
+            )
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_precision(self):

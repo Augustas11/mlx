@@ -632,14 +632,14 @@ void qmv_wide(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// macprovider: selects the affine weights whose small-M rows stay on the
-// per-row qmv kernel up to 16 rows, ahead of the qmm route (see
+// macprovider: selects the affine weights whose small-M rows take the qmv_mma
+// reduction (ml-explore/mlx#4787) on non-NAX GPUs, ahead of the qmm route (see
 // QuantizedMatmul::eval_gpu). Every test here reads the weight shape, type and
-// device, never the row count M, so a row takes the same kernel alone and
-// inside a batch. The shape set is the one the fork's earlier qmv_mma route
-// (ml-explore/mlx#4787) used; qmv_mma below stays built but is no longer
-// dispatched, since it cost single-row decode on M1.
-inline bool use_affine_row_qmv_window(
+// device, never the row count M, so a row takes the same reduction order alone
+// and inside a batch. Upstream starts qmv_mma at 3 or 4 rows and keeps Ultra
+// on qmv; both checks depend on M or the chip size, so they are dropped and
+// the window starts at 1 row, where qmv_mma1 computes the same bits.
+inline bool use_affine_qmv_mma(
     const array& w,
     const array& scales,
     QuantizationMode mode,
@@ -723,6 +723,53 @@ void qmv_mma(
   compute_encoder.dispatch_threadgroups(
       MTL::Size(N / bn, (M + rows_per_tg - 1) / rows_per_tg, 1),
       MTL::Size(32, wk, 1));
+}
+
+// macprovider: rows up to this count take qmv_mma1, more rows take qmv_mma.
+// This is a speed choice only: the two kernels give the same bits for a row
+// (see affine_qmv_mma1 in kernels/quantized.h), so moving the switch point
+// changes no result. Measured on an M3 Ultra with Llama 3.1 8B 4-bit: the
+// per-row kernels are ahead at 1 and 2 rows, qmv_mma from 3 rows up.
+constexpr int qmv_mma1_max_rows = 2;
+
+// One threadgroup per 8 output columns of one row; the grid height is the
+// row count. Any M works since a row never reads another row.
+void qmv_mma1(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  std::string type_string = get_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname, mode, "_qmv_mma1_", type_string, "_gs_", group_size, "_b_", bits);
+  auto kernel = get_quantized_kernel_wrapped(
+      d, kname, "qmv_mma1", mode, type_string, group_size, bits);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases) {
+    compute_encoder.set_input_array(*biases, c++);
+  }
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(N / 8, M, 1), MTL::Size(32, 1, 1));
 }
 
 void qvm_split_k(
@@ -1973,8 +2020,8 @@ void dispatch_qmv(
   // instead of once per row.
   // The route reads the weight shape and the device, never M:
   // - K not a multiple of 128 (gpt-oss, K = 2880) only. Aligned-K shapes
-  //   that miss the row qmv window (N < 512) stay on qmv, where qmv_wide cost
-  //   GLM-5-Next 0.7% of 4-row decode.
+  //   that miss qmv_mma (N < 512) stay on qmv, where qmv_wide cost GLM-5-Next
+  //   0.7% of 4-row decode.
   // - Gen 15 and 16 only. On gen 17 (M5) qmv_wide lost about a fifth of
   //   single-row Qwen3-8B decode speed to qmv.
   int gen = d.get_architecture_gen();
@@ -2029,37 +2076,61 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       x.shape(-2) > 1;
   int route_m = reference_prefill ? x.shape(-2) : M;
 
-  // macprovider: rows below the qmm route take the per-row qmv kernel (qmv_fast
-  // when K meets its alignment, as upstream picks for one row) when the weight
-  // shape qualifies, from 1 row up. Each qmv threadgroup reduces one row of x
-  // in an order set by K alone, so a row's bits do not depend on how many rows
-  // share the call. The test reads no row count, and the row limit is at least
-  // 17 so 1..16 rows always match bit for bit, where upstream would send rows
-  // from vector_limit up to qmm. An unaligned or non-contiguous x is copied
-  // into one [rows, K] block, so the route and the kernel instantiation cannot
-  // follow how a caller sliced its rows.
+  // macprovider: rows below the qmm route take the qmv_mma reduction when the
+  // weight shape qualifies, from 1 row up: four partial sums over 128-wide K
+  // blocks, added in one fixed order. That is the one reduction order of the
+  // whole window, and two kernels implement it: qmv_mma1 for 1 and 2 rows and
+  // qmv_mma (ml-explore/mlx#4787) for 3 rows and more. Both give the same bits
+  // for a row, so a row's result does not depend on how many rows share the
+  // call, and the switch point is a speed choice (qmv_mma1_max_rows). The
+  // weight test reads no row count, and the row limit is at least 17 so 1..16
+  // rows always match bit for bit, where upstream would send rows from
+  // vector_limit up to qmm. An unaligned or non-contiguous x is copied into
+  // one [rows, K] block rather than sent to qmv, so the route cannot follow
+  // how a caller sliced its rows.
+  // Bit equality of the two kernels and of every row count is checked by
+  // test_qmm_small_m_mma1_bit_equal and test_qmm_small_m_batch_invariant
+  // (python/tests/test_quantized.py) and by "test gpu small-M quantized matmul
+  // batch invariance" (tests/gpu_tests.cpp).
   if (transpose_ && !reference_prefill && w.ndim() == 2 && biases &&
-      use_affine_row_qmv_window(w, scales, mode_, group_size_, bits_, N, K)) {
+      use_affine_qmv_mma(w, scales, mode_, group_size_, bits_, N, K)) {
     int rows = x.size() / K;
     if (rows > 0 && rows < std::max(vector_limit, 17)) {
       if (!x.flags().row_contiguous || (x.offset() % (8 * x.itemsize()))) {
         x = contiguous_copy_gpu(x, s);
         metal::get_command_encoder(s).add_temporary(x);
       }
-      qmv(x,
-          w,
-          scales,
-          biases,
-          std::nullopt,
-          out,
-          group_size_,
-          bits_,
-          rows,
-          N,
-          K,
-          d,
-          s,
-          mode);
+      if (rows <= qmv_mma1_max_rows) {
+        qmv_mma1(
+            x,
+            w,
+            scales,
+            biases,
+            out,
+            group_size_,
+            bits_,
+            rows,
+            N,
+            K,
+            d,
+            s,
+            mode);
+      } else {
+        qmv_mma(
+            x,
+            w,
+            scales,
+            biases,
+            out,
+            group_size_,
+            bits_,
+            rows,
+            N,
+            K,
+            d,
+            s,
+            mode);
+      }
       return;
     }
   }

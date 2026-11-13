@@ -787,8 +787,12 @@ TEST_CASE("test layer norm vjp bias grad race") {
 TEST_CASE("test gpu small-M quantized matmul batch invariance") {
   // Continuous batching decodes a row alone and inside a batch of rows. Each
   // row of a small-M affine product must equal the same row computed alone,
-  // bit for bit. The first three shapes take the per-row qmv kernel up to 16
-  // rows on non-NAX GPUs; the last (N < 512) stays on qmv below the qmm route.
+  // bit for bit. On non-NAX GPUs the first three shapes take the qmv_mma
+  // reduction up to 16 rows: the row computed alone and the 2-row batch run
+  // qmv_mma1, the batches of 3 to 16 rows run qmv_mma, and the two kernels
+  // must give the same bits. The last shape (N < 512) stays on qmv below the
+  // qmm route. On NAX GPUs every shape here takes qmv and the kernel pair is
+  // not compared.
   struct Shape {
     int K;
     int N;
