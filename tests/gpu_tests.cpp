@@ -790,7 +790,9 @@ TEST_CASE("test gpu small-M quantized matmul batch invariance") {
   // bit for bit. On non-NAX GPUs the first three shapes take the qmv_mma
   // reduction up to 16 rows: the row computed alone runs qmv_mma1, the
   // batches of 2 to 16 rows run qmv_mma, and the two kernels must give the
-  // same bits. The last shape (N < 512) stays on qmv below the
+  // same bits. At 4 bits the lone row of 512x4096 (N >= 2 K) takes the
+  // wide-N form of qmv_mma1 and the other two the half2 form; at 8 bits all
+  // three take the scalar form. The last shape (N < 512) stays on qmv below the
   // qmm route. On NAX GPUs every shape here takes qmv and the kernel pair is
   // not compared.
   struct Shape {

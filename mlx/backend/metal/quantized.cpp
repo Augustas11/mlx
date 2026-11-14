@@ -748,8 +748,20 @@ void qmv_mma(
 // 120 on qmv_mma1 against 146 on qmv_mma.
 constexpr int qmv_mma1_max_rows = 1;
 
-// One threadgroup per 8 output columns of one row; the grid height is the
-// row count. Any M works since a row never reads another row.
+// The grid height is the row count; any M works since a row never reads
+// another row. Three kernels give the same bits (see affine_qmv_mma1 in
+// kernels/quantized.h), so the choice among them is a speed choice only.
+// Measured on an M3 Ultra, one row, float16 group 64, us per dispatch:
+// - 4-bit: the wide-N form (qmv_mma1w, 16 columns per threadgroup) won only
+//   at 4096x14336 (51.9/~56 against 61.6/64.1 for the half2 form) and lost
+//   everywhere N < 2 K (4096x4096 37.3/34.8 against 31.0/28.7, 14336x4096
+//   87.8/~84 against 64.3/60.8, 4096x1024 34.5/~31 against 24.0/22.8,
+//   1664x2048 24.8/~24 against 19.8/20.0). So N >= 2 K takes qmv_mma1w and
+//   every other 4-bit shape the half2 form (qmv_mma1, 8 columns).
+// - 8-bit: the half2 form was within about +-8% of the scalar form except
+//   4096x1024, where it was 21% slower, and the wide form was slower
+//   everywhere. Nothing pays for that loss, so 8-bit keeps the scalar form
+//   (qmv_mma1s, 8 columns).
 void qmv_mma1(
     const array& x,
     const array& w,
@@ -764,13 +776,31 @@ void qmv_mma1(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
+  std::string func = "qmv_mma1";
+  int cols = 8; // output columns per threadgroup
+  if (bits == 8) {
+    func = "qmv_mma1s";
+  } else if (N >= 2 * K) {
+    // N % 16 == 0 holds: use_affine_qmv_mma admits no other N.
+    func = "qmv_mma1w";
+    cols = 16;
+  }
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
   concatenate(
-      kname, mode, "_qmv_mma1_", type_string, "_gs_", group_size, "_b_", bits);
+      kname,
+      mode,
+      "_",
+      func,
+      "_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits);
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmv_mma1", mode, type_string, group_size, bits);
+      d, kname, func, mode, type_string, group_size, bits);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -785,7 +815,7 @@ void qmv_mma1(
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.dispatch_threadgroups(
-      MTL::Size(N / 8, M, 1), MTL::Size(32, 1, 1));
+      MTL::Size(N / cols, M, 1), MTL::Size(32, 1, 1));
 }
 
 void qvm_split_k(
@@ -2095,8 +2125,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // macprovider: rows below the qmm route take the qmv_mma reduction when the
   // weight shape qualifies, from 1 row up: four partial sums over 128-wide K
   // blocks, added in one fixed order. That is the one reduction order of the
-  // whole window, and two kernels implement it: qmv_mma1 for 1 row and
-  // qmv_mma (ml-explore/mlx#4787) for 2 rows and more. Both give the same bits
+  // whole window, and two kernels implement it: qmv_mma1 for 1 row (in one
+  // of three forms, picked by shape in qmv_mma1) and qmv_mma
+  // (ml-explore/mlx#4787) for 2 rows and more. Both give the same bits
   // for a row, so a row's result does not depend on how many rows share the
   // call, and the switch point is a speed choice (qmv_mma1_max_rows). The
   // weight test reads no row count, and the row limit is at least 17 so 1..16

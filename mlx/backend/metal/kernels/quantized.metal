@@ -239,4 +239,19 @@ instantiate_qmv_mma_groups(8)
   instantiate_qmv_mma1_types(32, bits)
 
 instantiate_qmv_mma1_groups(4)
-instantiate_qmv_mma1_groups(8) // clang-format on
+instantiate_qmv_mma1_groups(8)
+
+// macprovider: quantized.cpp (qmv_mma1) sends only 4-bit weights to the wide
+// form and only 8-bit weights to the scalar form.
+#define instantiate_qmv_mma1_form_types(name, group_size, bits) \
+  instantiate_quantized(name, float, group_size, bits)          \
+  instantiate_quantized(name, float16_t, group_size, bits)      \
+  instantiate_quantized(name, bfloat16_t, group_size, bits)
+
+#define instantiate_qmv_mma1_form_groups(name, bits) \
+  instantiate_qmv_mma1_form_types(name, 128, bits)   \
+  instantiate_qmv_mma1_form_types(name, 64, bits)    \
+  instantiate_qmv_mma1_form_types(name, 32, bits)
+
+instantiate_qmv_mma1_form_groups(affine_qmv_mma1w, 4)
+instantiate_qmv_mma1_form_groups(affine_qmv_mma1s, 8) // clang-format on

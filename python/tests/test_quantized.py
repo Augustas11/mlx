@@ -740,6 +740,12 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # 1664 = 13 * 128, so the four partial sums cover 4, 3, 3 and 3 K
         # blocks.
         #
+        # The single row takes one of three forms of qmv_mma1 (see qmv_mma1
+        # in mlx/backend/metal/quantized.cpp): 4-bit with N >= 2 K takes the
+        # wide-N form (1024x2048 at N == 2 K and 512x4096), other 4-bit
+        # shapes the half2 form (1152x2288 sits just below N == 2 K), and
+        # 8-bit the scalar form.
+        #
         # On NAX GPUs the route is off and all these row counts take qmv. The
         # assertions still run there, but they compare qmv with itself and
         # say nothing about qmv_mma1 against qmv_mma; the test then reports
@@ -772,7 +778,14 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
         rows = 9
         for (K, N), bits, gs, dtype, kind in product(
-            [(4096, 4096), (4096, 1024), (1664, 2048)],
+            [
+                (4096, 4096),
+                (4096, 1024),
+                (1664, 2048),
+                (1024, 2048),
+                (512, 4096),
+                (1152, 2288),
+            ],
             [4, 8],
             [32, 64, 128],
             [mx.float32, mx.float16, mx.bfloat16],
