@@ -1798,6 +1798,215 @@ template <
       simd_lid);
 }
 
+// macprovider: affine_qmv_fast_rows and its three helpers below compute MR
+// rows of x in one dispatch, each output element by exactly the float
+// operations upstream's affine_qmv_fast (qmv_fast_impl, non-batched,
+// partial_rows = false) performs for that row alone: the same thread layout
+// (2 simdgroups x 4 output columns, 32 lanes each), the same K-block walk,
+// the same per-lane qdot expression and accumulation order, and the same
+// per-element simd_sum. The only change is where operands come from: per K
+// block the 4 columns' weights, scales and biases are read once and reused
+// for every row, where qmv_fast reads them once per row.
+// Why: every other MLX runtime keeps a lone decode row on upstream's one-row
+// kernel and makes multi-row windows that must agree with it (an MTP / spec
+// verify pass of one request, a 2-row batch) reproduce that one-row
+// arithmetic. This kernel is that design ("stock order") for qmv_fast.
+// Invariant: a row in a 2..16 row call equals, bit for bit, that row
+// computed alone by upstream's qmv_fast.
+// Evidence: a standalone Metal harness (this kernel text, affine_qmv_fast
+// copied verbatim from MLX, built with -fno-fast-math like CMake's
+// METAL_FLAGS) found 0 differing output elements against per-row qmv_fast on
+// an Apple M5 and an Apple M3 Ultra (float16, group 64, bits 4 and 8, K x N
+// 4096x4096, 4096x14336, 14336x4096, M 1/2/4/8/16; float32 and groups 32 /
+// 128 on the M5 only).
+// Requires K % block_size == 0 (512 at 4 bits, 256 at 8 bits, the qmv_fast
+// gate) and N % 8 == 0; there is no tail or partial-row path and no batched
+// (B > 1) path. Bits 4 and 8 only.
+
+// Unpack one lane's weights for one output column exactly as qdot reads them:
+// the masked integer (not shifted) converted to U. The conversion is exact,
+// and qdot performs the same int->float conversion inside its multiply.
+template <typename U, int values_per_thread, int bits>
+inline void unpack_qdot_weights(const device uint8_t* w, thread U* w_f) {
+  static_assert(bits == 4 || bits == 8, "qmv_fast_rows covers bits 4 and 8");
+  if (bits == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      w_f[4 * i] = U(ws[i] & 0x000f);
+      w_f[4 * i + 1] = U(ws[i] & 0x00f0);
+      w_f[4 * i + 2] = U(ws[i] & 0x0f00);
+      w_f[4 * i + 3] = U(ws[i] & 0xf000);
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      w_f[i] = U(w[i]);
+    }
+  }
+}
+
+// Same expression tree as qdot<U, values_per_thread, bits> (bits 4 and 8),
+// with the weight operand already unpacked.
+template <typename U, int values_per_thread, int bits>
+inline U qdot_unpacked(
+    const thread U* w_f,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  U accum = 0;
+  if (bits == 4) {
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum +=
+          (x_thread[4 * i] * w_f[4 * i] +
+           x_thread[4 * i + 1] * w_f[4 * i + 1] +
+           x_thread[4 * i + 2] * w_f[4 * i + 2] +
+           x_thread[4 * i + 3] * w_f[4 * i + 3]);
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      accum += x_thread[i] * w_f[i];
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
+// Weights kept packed in registers (read from device once per K block); each
+// row re-masks them. Same expression text as qdot.
+template <typename U, int values_per_thread, int bits>
+inline U qdot_regs(
+    const thread uint8_t* w,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  U accum = 0;
+  if (bits == 4) {
+    const thread uint16_t* ws = (const thread uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum +=
+          (x_thread[4 * i] * (ws[i] & 0x000f) +
+           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      accum += x_thread[i] * w[i];
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
+// y[m][n] for MR rows per threadgroup. Grid (ceil(M / MR), N / 8, 1),
+// threadgroup (32, 2, 1). packed = true holds the raw weight words in
+// registers and re-masks them per row; packed = false holds them unpacked as
+// floats. x is re-read per row (each row's x is used once anyway).
+template <typename T, int group_size, int bits, int MR, bool packed>
+[[kernel]] void affine_qmv_fast_rows(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  thread U x_thread[values_per_thread];
+  thread U w_f[results_per_simdgroup][packed ? 1 : values_per_thread];
+  constexpr int wbytes = values_per_thread * bytes_per_pack / pack_factor;
+  thread uint32_t w_p[results_per_simdgroup][packed ? wbytes / 4 : 1];
+  thread U s_r[results_per_simdgroup];
+  thread U b_r[results_per_simdgroup];
+  thread U result[MR][results_per_simdgroup];
+  for (int m = 0; m < MR; m++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[m][row] = 0;
+    }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const int m0 = tid.x * MR;
+  const int rows = min(MR, M - m0);
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += m0 * in_vec_size + simd_lid * values_per_thread;
+  y += m0 * out_vec_size + out_row;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      if (packed) {
+        const device uint32_t* src =
+            (const device uint32_t*)(ws + row * in_vec_size_w);
+        for (int j = 0; j < wbytes / 4; j++) {
+          w_p[row][j] = src[j];
+        }
+      } else {
+        unpack_qdot_weights<U, values_per_thread, bits>(
+            ws + row * in_vec_size_w, w_f[row]);
+      }
+      s_r[row] = scales[row * in_vec_size_g];
+      b_r[row] = biases[row * in_vec_size_g];
+    }
+
+    for (int m = 0; m < MR; m++) {
+      if (m < rows) {
+        U sum = load_vector<T, U, values_per_thread, bits>(
+            x + m * in_vec_size, x_thread);
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          if (packed) {
+            result[m][row] += qdot_regs<U, values_per_thread, bits>(
+                (const thread uint8_t*)w_p[row],
+                x_thread,
+                s_r[row],
+                b_r[row],
+                sum);
+          } else {
+            result[m][row] += qdot_unpacked<U, values_per_thread, bits>(
+                w_f[row], x_thread, s_r[row], b_r[row], sum);
+          }
+        }
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+
+  for (int m = 0; m < MR; m++) {
+    if (m < rows) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        U r = simd_sum(result[m][row]);
+        if (simd_lid == 0) {
+          y[m * out_vec_size + row] = static_cast<T>(r);
+        }
+      }
+    }
+  }
+}
+
 template <
     typename T,
     int group_size,

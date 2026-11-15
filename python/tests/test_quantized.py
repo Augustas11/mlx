@@ -1,5 +1,6 @@
 # Copyright © 2023-2026 Apple Inc.
 
+import json
 import math
 import os
 import platform
@@ -911,6 +912,118 @@ print(" ".join([first] + [row0(M) for M in (1, 2, 4, 8, 16)]))
         self.assertEqual(len(set(unset)), 1)
         # Read once: setting "0" after the first product changes nothing.
         self.assertEqual(late, unset)
+
+    def test_qmm_small_m_stock_order_rows_equal_lone(self):
+        # MLX_METAL_SMALL_M_ROW_INVARIANT=2 is the "stock order" lab route: one
+        # row takes the upstream route (qmv_fast for these shapes), and 2 to 16
+        # rows take affine_qmv_fast_rows, which must reproduce qmv_fast's
+        # arithmetic per row. So each row of a 2, 3, 4, 8, 9 and 16 row
+        # product must have the same raw bits as that row computed alone.
+        #
+        # Shapes: 4096x4096, 4096x1024 and 512x4096 qualify (K a multiple of
+        # 512, the qmv_fast K step at 4 bits, and of 256 at 8 bits).
+        # 4096x8192 qualifies too and is the witness: on the upstream route
+        # ("0") its 16 rows reach qmm (every non-NAX row limit for it is 13 or
+        # less) and differ from the lone rows, so equality under "2" shows the
+        # rows kernel ran. 1152x2048 passes the weight test but one row of it
+        # takes plain qmv, not qmv_fast, so under "2" all its row counts must
+        # fall through to the upstream route: the same bits as under "0".
+        #
+        # The variable is read once per process, so each setting runs in its
+        # own interpreter. On NAX GPUs the route gate is off and "2" is the
+        # upstream route; the test then skips.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        # Mirrors metal::is_nax_available() as in test_qmm_small_m_mma1_bit_equal.
+        arch = mx.device_info().get("architecture", "")
+        digits = "".join(ch for ch in arch.split("_g")[-1] if ch.isdigit())
+        if digits:
+            release = tuple(int(v) for v in platform.mac_ver()[0].split(".")[:2])
+            if release >= (26, 2) and int(digits) >= (18 if arch[-1] == "p" else 17):
+                self.skipTest(
+                    "NAX GPU: the small-M route gate is off, so "
+                    "MLX_METAL_SMALL_M_ROW_INVARIANT=2 takes the upstream route; "
+                    "affine_qmv_fast_rows was NOT exercised here"
+                )
+        child = r"""
+import hashlib, json
+from itertools import product
+import mlx.core as mx
+mx.random.seed(2)
+def bits_of(a):
+    return mx.view(a, mx.uint32 if a.dtype == mx.float32 else mx.uint16)
+def digest(a):
+    a = bits_of(a)
+    mx.eval(a)
+    return hashlib.sha256(bytes(memoryview(a))).hexdigest()
+def sym(shape):
+    return mx.random.uniform(-1.0, 1.0, shape)
+def pow2(lo, hi, shape):
+    return mx.power(2.0, mx.random.randint(lo, hi, shape).astype(mx.float32))
+res = {}
+for (K, N), bits, gs, dtype in product(
+    [(4096, 4096), (4096, 1024), (512, 4096), (4096, 8192), (1152, 2048)],
+    [4, 8],
+    [32, 64, 128],
+    [mx.float16, mx.float32],
+):
+    w_shape = (N, K * bits // 32)
+    w_q = mx.bitwise_or(
+        mx.left_shift(mx.random.randint(0, 1 << 16, w_shape).astype(mx.uint32), 16),
+        mx.random.randint(0, 1 << 16, w_shape).astype(mx.uint32),
+    )
+    s_shape = (N, K // gs)
+    scales = (sym(s_shape) * pow2(-14, -4, s_shape)).astype(dtype)
+    biases = (sym(s_shape) * pow2(-10, 1, s_shape)).astype(dtype)
+    x = (sym((16, K)) * pow2(-8, 3, (16, K))).astype(dtype)
+    mx.eval(w_q, scales, biases, x)
+    def qmm(v):
+        return mx.quantized_matmul(
+            v, w_q, scales, biases, transpose=True, group_size=gs, bits=bits
+        )
+    alone = mx.concatenate([qmm(x[i : i + 1]) for i in range(16)])
+    entry = {"1": digest(alone)}
+    for M in (2, 3, 4, 8, 9, 16):
+        out = qmm(x[:M])
+        equal = mx.array_equal(bits_of(out), bits_of(alone[:M])).item()
+        entry[str(M)] = [digest(out), equal]
+    res[f"{K}x{N} bits={bits} gs={gs} {dtype}"] = entry
+print(json.dumps(res))
+"""
+
+        def run(value):
+            env = dict(os.environ)
+            env["MLX_METAL_SMALL_M_ROW_INVARIANT"] = value
+            out = subprocess.run(
+                [sys.executable, "-c", child],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(out.stdout)
+
+        stock = run("2")
+        upstream = run("0")
+        self.assertEqual(stock.keys(), upstream.keys())
+        for key, entry in stock.items():
+            # One row takes the upstream route under "2".
+            with self.subTest(case=key, M=1):
+                self.assertEqual(entry["1"], upstream[key]["1"])
+            if key.startswith("1152x2048"):
+                # Not a qmv_fast shape: every row count falls through.
+                with self.subTest(case=key, fall_through=True):
+                    self.assertEqual(entry, upstream[key])
+                continue
+            for M in ("2", "3", "4", "8", "9", "16"):
+                with self.subTest(case=key, M=M):
+                    self.assertTrue(entry[M][1])
+        witness = [k for k in upstream if k.startswith("4096x8192")]
+        self.assertTrue(
+            any(not upstream[k]["16"][1] for k in witness),
+            "16 rows of 4096x8192 matched the lone rows on the upstream route "
+            "too, so this run does not show that affine_qmv_fast_rows ran",
+        )
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_precision(self):

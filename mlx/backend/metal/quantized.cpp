@@ -632,6 +632,27 @@ void qmv_wide(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// macprovider: MLX_METAL_SMALL_M_ROW_INVARIANT selects the small-M route of
+// the weights use_affine_qmv_mma accepts:
+//   unset or 1 (or any value other than 0 and 2): the row-invariant
+//     qmv_mma1 / qmv_mma pair for 1..16 rows;
+//   0: the upstream routes (qmv / qmm);
+//   2: "stock order", a lab switch: 1 row takes the upstream route, 2..16
+//     rows take affine_qmv_fast_rows, which reproduces qmv_fast's per-row
+//     arithmetic, when one row of that shape takes qmv_fast (see
+//     qmv_fast_rows and QuantizedMatmul::eval_gpu).
+// Read once, at the first product that reaches this test: a route that could
+// change inside a process would let state computed on one route continue on
+// the other. A per-call route is planned; until then the value holds for the
+// whole process.
+inline int small_m_route() {
+  static const int route = [] {
+    int v = env::get_var("MLX_METAL_SMALL_M_ROW_INVARIANT", 1);
+    return (v == 0 || v == 2) ? v : 1;
+  }();
+  return route;
+}
+
 // macprovider: selects the affine weights whose small-M rows take the qmv_mma
 // reduction (ml-explore/mlx#4787) on non-NAX GPUs, ahead of the qmm route (see
 // QuantizedMatmul::eval_gpu). Every test here reads the weight shape, type and
@@ -639,6 +660,7 @@ void qmv_wide(
 // and inside a batch. Upstream starts qmv_mma at 3 or 4 rows and keeps Ultra
 // on qmv; both checks depend on M or the chip size, so they are dropped and
 // the window starts at 1 row, where qmv_mma1 computes the same bits.
+// The stock-order route (small_m_route() == 2) uses the same weight test.
 inline bool use_affine_qmv_mma(
     const array& w,
     const array& scales,
@@ -656,12 +678,8 @@ inline bool use_affine_qmv_mma(
   // MLX_METAL_SMALL_M_ROW_INVARIANT=0 to take the per-row qmv / qmm route
   // below, which is what upstream runs and is faster at one row. The default
   // keeps the window, so leaving the variable unset can cost speed, never a
-  // row's bits. Read once, at the first product that reaches this test: a
-  // route that could change inside a process would let state computed on one
-  // route continue on the other.
-  static const bool row_invariant =
-      env::get_var("MLX_METAL_SMALL_M_ROW_INVARIANT", 1) != 0;
-  if (!row_invariant) {
+  // row's bits. The value is read once per process (small_m_route).
+  if (small_m_route() == 0) {
     return false;
   }
   if ((bits != 4 && bits != 8) ||
@@ -816,6 +834,79 @@ void qmv_mma1(
   compute_encoder.set_bytes(N, c++);
   compute_encoder.dispatch_threadgroups(
       MTL::Size(N / (32 / wk), M, 1), MTL::Size(32, 1, 1));
+}
+
+// macprovider: the stock-order lab route (MLX_METAL_SMALL_M_ROW_INVARIANT=2).
+// affine_qmv_fast_rows (kernels/quantized.h) computes 2..16 rows in one
+// dispatch with, for every output element, exactly the float operations of
+// upstream's affine_qmv_fast for that row alone, so a row in a 2..16 row call
+// equals that row computed alone by qmv_fast bit for bit. A standalone harness
+// found 0 differing elements against per-row qmv_fast on an Apple M5 and an
+// Apple M3 Ultra. It is a lab switch, not yet measured for decode speed. It is
+// slower than qmv_mma for wide batches: standalone on an M3 Ultra it took
+// 0.87-0.92x qmv_mma's time at 2 rows, 1.3-1.5x at 4, 1.9-2.6x at 8 and
+// 2.1-2.9x at 16.
+// MR = 4 rows per threadgroup; 4 bits keep the raw weight words in registers
+// (packed), 8 bits keep unpacked floats, the faster variant of each in the M3
+// Ultra timing. Grid (ceil(M / 4), N / 8, 1), threadgroup (32, 2, 1), as in
+// the harness. Callers guarantee K % qmv_fast_k_alignment(bits) == 0,
+// N % 8 == 0, bits 4 or 8, a row-contiguous [M, K] x and no batch.
+void qmv_fast_rows(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  constexpr int mr = 4;
+  const bool packed = (bits == 4);
+  std::string type_string = get_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      mode,
+      "_qmv_fast_rows_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_mr_",
+      mr,
+      "_p_",
+      packed ? 1 : 0);
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qmv_fast_rows",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      mr,
+      packed);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  compute_encoder.set_input_array(*biases, c++);
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size((M + mr - 1) / mr, N / 8, 1), MTL::Size(32, 2, 1));
 }
 
 void qvm_split_k(
@@ -2142,7 +2233,41 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (transpose_ && !reference_prefill && w.ndim() == 2 && biases &&
       use_affine_qmv_mma(w, scales, mode_, group_size_, bits_, N, K)) {
     int rows = x.size() / K;
-    if (rows > 0 && rows < std::max(vector_limit, 17)) {
+    if (small_m_route() == 2) {
+      // macprovider: stock order (lab switch, see qmv_fast_rows). One row
+      // takes the upstream route below unchanged. 2..16 rows take
+      // qmv_fast_rows if and only if one row of this shape takes plain
+      // affine_qmv_fast on the upstream route. Under the weight test above
+      // (affine, no NAX, bits 4 or 8, K % 128 == 0, K >= 512, N % 16 == 0,
+      // biases, 2-D w) one row (M = 1, below every vector_limit) never
+      // reaches qmm, qmv_quad (K is 64 or 128 only), qmv_wide (K % 128 != 0
+      // only) or a NAX path, and qmv picks qmv_fast without partial rows
+      // exactly when K % qmv_fast_k_alignment(bits) == 0 (512 at 4 bits, 256
+      // at 8). A shape that fails that test (e.g. K = 1152) takes plain qmv
+      // for one row, which this kernel does not reproduce, so all its row
+      // counts fall through to the upstream route; so do rows above 16.
+      if (rows >= 2 && rows <= 16 && K % qmv_fast_k_alignment(bits_) == 0) {
+        if (!x.flags().row_contiguous) {
+          x = contiguous_copy_gpu(x, s);
+          metal::get_command_encoder(s).add_temporary(x);
+        }
+        qmv_fast_rows(
+            x,
+            w,
+            scales,
+            biases,
+            out,
+            group_size_,
+            bits_,
+            rows,
+            N,
+            K,
+            d,
+            s,
+            mode);
+        return;
+      }
+    } else if (rows > 0 && rows < std::max(vector_limit, 17)) {
       if (!x.flags().row_contiguous || (x.offset() % (8 * x.itemsize()))) {
         x = contiguous_copy_gpu(x, s);
         metal::get_command_encoder(s).add_temporary(x);
