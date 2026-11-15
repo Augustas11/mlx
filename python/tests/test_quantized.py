@@ -1012,6 +1012,11 @@ print(json.dumps(res))
         def run(value):
             env = dict(os.environ)
             env["MLX_METAL_SMALL_M_ROW_INVARIANT"] = value
+            # The stock-order route defaults to 8 partial sums on some GPU
+            # generations and the row-invariant route to 4 everywhere. Pin
+            # one value so the 3..16 row products of the two routes are the
+            # same kernel and can be compared bit for bit.
+            env["MLX_METAL_QMV_MMA_WK"] = "8"
             out = subprocess.run(
                 [sys.executable, "-c", child],
                 env=env,
