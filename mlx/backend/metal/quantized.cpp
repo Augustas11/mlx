@@ -637,10 +637,35 @@ void qmv_wide(
 //   unset or 1 (or any value other than 0 and 2): the row-invariant
 //     qmv_mma1 / qmv_mma pair for 1..16 rows;
 //   0: the upstream routes (qmv / qmm);
-//   2: "stock order", a lab switch: 1 row takes the upstream route, 2..16
-//     rows take affine_qmv_fast_rows, which reproduces qmv_fast's per-row
-//     arithmetic, when one row of that shape takes qmv_fast (see
-//     qmv_fast_rows and QuantizedMatmul::eval_gpu).
+//   2: "stock order": 1 row takes the upstream route; exactly 2 rows run the
+//     upstream one-row kernel's per-row arithmetic (affine_qmv_fast_rows
+//     where one row takes qmv_fast, affine_qmv with the row in the grid
+//     where one row takes plain qmv); 3..16 rows take qmv_mma exactly as
+//     the default route does; more rows are unchanged (see
+//     QuantizedMatmul::eval_gpu). Guarantees: a row of a 2-row call equals
+//     that row computed alone, bit for bit; the rows of 3..16-row calls
+//     equal each other across those row counts; a row of a 3+ row call can
+//     differ from the lone row in low bits (qmv_mma sums K in another
+//     order).
+//     Why: measured on an M3 Ultra (generation 15), every quantized linear
+//     of a real 4-bit model chained once per pass, ms per pass at rows
+//     1 / 2 / 3 / 4 / 5 / 8 / 16:
+//       Llama 3.1 8B  qmv_fast_rows 2..16: 8.76 / 12.27 / 16.22 / 20.24 /
+//                       23.05 / 32.92 / 59.53
+//                     route 1 (WK 8):     9.96 / 12.85 / 12.89 / 12.93 /
+//                       12.96 / 13.01 / 22.08
+//                     route 0:            8.75 / 10.62 / 13.69 / 16.96 /
+//                       20.50 / 29.35 / 44.88
+//       27B model     qmv_fast_rows 2..16: 26.45 / 36.51 / 48.79 / 61.42 /
+//                       71.77 / 105.66 / 209.64
+//                     route 1:            30.38 / 39.05 / 39.08 / 39.13 /
+//                       38.34 / 39.34 / 79.35
+//                     route 0:            26.55 / 32.04 / 43.23 / 54.31 /
+//                       65.63 / 95.15 / 154.32
+//     One row on the upstream route matches route 0; two rows on
+//     qmv_fast_rows are 4-7% faster than qmv_mma (12.27 vs 12.85, 36.51 vs
+//     39.05); from three rows qmv_mma is faster. The 2-row plain-qmv
+//     shapes (K not a multiple of the qmv_fast K step) were not measured.
 // Read once, at the first product that reaches this test: a route that could
 // change inside a process would let state computed on one route continue on
 // the other. A per-call route is planned; until then the value holds for the
@@ -836,16 +861,15 @@ void qmv_mma1(
       MTL::Size(N / (32 / wk), M, 1), MTL::Size(32, 1, 1));
 }
 
-// macprovider: the stock-order lab route (MLX_METAL_SMALL_M_ROW_INVARIANT=2).
-// affine_qmv_fast_rows (kernels/quantized.h) computes 2..16 rows in one
-// dispatch with, for every output element, exactly the float operations of
-// upstream's affine_qmv_fast for that row alone, so a row in a 2..16 row call
+// macprovider: the 2-row stock-order kernel (MLX_METAL_SMALL_M_ROW_INVARIANT=2,
+// see small_m_route). affine_qmv_fast_rows (kernels/quantized.h) computes
+// rows in one dispatch with, for every output element, exactly the float
+// operations of upstream's affine_qmv_fast for that row alone, so a row
 // equals that row computed alone by qmv_fast bit for bit. A standalone harness
 // found 0 differing elements against per-row qmv_fast on an Apple M5 and an
-// Apple M3 Ultra. It is a lab switch, not yet measured for decode speed. It is
-// slower than qmv_mma for wide batches: standalone on an M3 Ultra it took
-// 0.87-0.92x qmv_mma's time at 2 rows, 1.3-1.5x at 4, 1.9-2.6x at 8 and
-// 2.1-2.9x at 16.
+// Apple M3 Ultra, and the small-M tests passed on the M3 Ultra with it
+// serving 2..16 rows. The route sends it 2 rows only: in the model passes
+// measured in small_m_route it beat qmv_mma at 2 rows and lost from 3.
 // MR = 4 rows per threadgroup; 4 bits keep the raw weight words in registers
 // (packed), 8 bits keep unpacked floats, the faster variant of each in the M3
 // Ultra timing. Grid (ceil(M / 4), N / 8, 1), threadgroup (32, 2, 1), as in
@@ -2233,24 +2257,38 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (transpose_ && !reference_prefill && w.ndim() == 2 && biases &&
       use_affine_qmv_mma(w, scales, mode_, group_size_, bits_, N, K)) {
     int rows = x.size() / K;
-    if (small_m_route() == 2) {
-      // macprovider: stock order (lab switch, see qmv_fast_rows). One row
-      // takes the upstream route below unchanged. 2..16 rows take
-      // qmv_fast_rows if and only if one row of this shape takes plain
-      // affine_qmv_fast on the upstream route. Under the weight test above
+    const bool stock_order = (small_m_route() == 2);
+    if (stock_order && rows == 2) {
+      // macprovider: stock order, 2 rows (see small_m_route for the
+      // measurement). Each row must equal that row computed alone on the
+      // upstream one-row route, bit for bit. Under the weight test above
       // (affine, no NAX, bits 4 or 8, K % 128 == 0, K >= 512, N % 16 == 0,
       // biases, 2-D w) one row (M = 1, below every vector_limit) never
       // reaches qmm, qmv_quad (K is 64 or 128 only), qmv_wide (K % 128 != 0
-      // only) or a NAX path, and qmv picks qmv_fast without partial rows
-      // exactly when K % qmv_fast_k_alignment(bits) == 0 (512 at 4 bits, 256
-      // at 8). A shape that fails that test (e.g. K = 1152) takes plain qmv
-      // for one row, which this kernel does not reproduce, so all its row
-      // counts fall through to the upstream route; so do rows above 16.
-      if (rows >= 2 && rows <= 16 && K % qmv_fast_k_alignment(bits_) == 0) {
-        if (!x.flags().row_contiguous) {
-          x = contiguous_copy_gpu(x, s);
-          metal::get_command_encoder(s).add_temporary(x);
-        }
+      // only) or a NAX path: it takes qmv(), which runs affine_qmv_fast
+      // (no partial rows, N % 8 == 0) when K % qmv_fast_k_alignment(bits)
+      // == 0 (512 at 4 bits, 256 at 8) and plain affine_qmv otherwise (e.g.
+      // K = 1152, or K = 768 at 4 bits).
+      // - qmv_fast shapes: qmv_fast_rows, which runs qmv_fast's per-row float
+      //   operations with each K block's weights read once for both rows.
+      // - other shapes: the same qmv() call with M = 2, i.e. the one-row
+      //   kernel with the row in the grid (grid (M, N / 8, 1)). affine_qmv
+      //   (qmv_impl in kernels/quantized.h) takes its row from tid.x only:
+      //   it offsets x and y by tid.x * K and tid.x * N and never reads M,
+      //   so each threadgroup runs exactly the instructions of the M = 1
+      //   call for that row. The pipeline is the same instantiation too:
+      //   B = 1 (batch_0), partial_rows false, no global scale, 4 results
+      //   per simdgroup. One dispatch was chosen over two one-row
+      //   dispatches because it is the same per-row code with one launch.
+      // Not qmv_wide, upstream MLX's choice for 2 rows below vector_limit:
+      // it reduces a row in a different order than the one-row kernel.
+      // Calling qmv() here keeps the 2-row result independent of
+      // vector_limit and of dispatch_qmv's routing.
+      if (!x.flags().row_contiguous) {
+        x = contiguous_copy_gpu(x, s);
+        metal::get_command_encoder(s).add_temporary(x);
+      }
+      if (K % qmv_fast_k_alignment(bits_) == 0) {
         qmv_fast_rows(
             x,
             w,
@@ -2265,9 +2303,29 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
             d,
             s,
             mode);
-        return;
+      } else {
+        qmv(x,
+            w,
+            scales,
+            biases,
+            std::nullopt,
+            out,
+            group_size_,
+            bits_,
+            rows,
+            N,
+            K,
+            d,
+            s,
+            mode);
       }
-    } else if (rows > 0 && rows < std::max(vector_limit, 17)) {
+      return;
+    }
+    // macprovider: stock order sends 3..16 rows here, to the same qmv_mma
+    // call as the default route (rows > qmv_mma1_max_rows); 1 row and more
+    // than 16 rows fall through to the upstream route below.
+    if (stock_order ? (rows >= 3 && rows <= 16)
+                    : (rows > 0 && rows < std::max(vector_limit, 17))) {
       if (!x.flags().row_contiguous || (x.offset() % (8 * x.itemsize()))) {
         x = contiguous_copy_gpu(x, s);
         metal::get_command_encoder(s).add_temporary(x);

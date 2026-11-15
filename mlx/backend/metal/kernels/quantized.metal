@@ -258,9 +258,10 @@ instantiate_qmv_mma_groups(8)
 instantiate_qmv_mma1_groups(4)
 instantiate_qmv_mma1_groups(8)
 
-// macprovider: the stock-order lab route (MLX_METAL_SMALL_M_ROW_INVARIANT=2)
-// uses MR = 4 with packed register weights at 4 bits and unpacked float
-// weights at 8 bits, the faster pair in the standalone M3 Ultra timing.
+// macprovider: the stock-order route (MLX_METAL_SMALL_M_ROW_INVARIANT=2)
+// sends 2-row calls here. MR = 4 with packed register weights at 4 bits and
+// unpacked float weights at 8 bits, the faster pair in the standalone M3
+// Ultra timing.
 #define instantiate_qmv_fast_rows(type, group_size, bits, mr, packed)  \
   instantiate_kernel(                                                  \
       "affine_qmv_fast_rows_" #type "_gs_" #group_size "_b_" #bits     \

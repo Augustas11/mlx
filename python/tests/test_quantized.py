@@ -914,24 +914,35 @@ print(" ".join([first] + [row0(M) for M in (1, 2, 4, 8, 16)]))
         self.assertEqual(late, unset)
 
     def test_qmm_small_m_stock_order_rows_equal_lone(self):
-        # MLX_METAL_SMALL_M_ROW_INVARIANT=2 is the "stock order" lab route: one
-        # row takes the upstream route (qmv_fast for these shapes), and 2 to 16
-        # rows take affine_qmv_fast_rows, which must reproduce qmv_fast's
-        # arithmetic per row. So each row of a 2, 3, 4, 8, 9 and 16 row
-        # product must have the same raw bits as that row computed alone.
+        # MLX_METAL_SMALL_M_ROW_INVARIANT=2 is the "stock order" route for
+        # weights that pass the small-M gate: one row takes the upstream route,
+        # exactly 2 rows run the upstream one-row kernel's per-row arithmetic
+        # (affine_qmv_fast_rows where one row takes qmv_fast, affine_qmv with
+        # the row in the grid where one row takes plain qmv), and 3 to 16 rows
+        # take qmv_mma as the default route ("1") does. Checked on raw bits:
+        # - "2", one row equals "0", one row;
+        # - "2", every row of a 2-row product equals that row alone, for rows
+        #   0-1 and for rows 7-8 (an x slice at an offset);
+        # - "2", every row of a 3, 4, 8, 9 and 16-row product equals the same
+        #   row of the 16-row product (batch invariance from 3 rows), and
+        #   these products equal the default route's ("1");
+        # - contrast: in at least one case a row of a 3-row product under "2"
+        #   differs from the lone row. That shows the gate was on and qmv_mma
+        #   ran in that process, and that these inputs tell qmv_mma's order
+        #   from the one-row kernel's; the 2-row rows of the same process
+        #   matched the lone rows, so the 2-row call did not take qmv_mma.
+        #   (The old contrast, 16 upstream rows reaching qmm, no longer says
+        #   anything about the 2-row path.)
         #
-        # Shapes: 4096x4096, 4096x1024 and 512x4096 qualify (K a multiple of
-        # 512, the qmv_fast K step at 4 bits, and of 256 at 8 bits).
-        # 4096x8192 qualifies too and is the witness: on the upstream route
-        # ("0") its 16 rows reach qmm (every non-NAX row limit for it is 13 or
-        # less) and differ from the lone rows, so equality under "2" shows the
-        # rows kernel ran. 1152x2048 passes the weight test but one row of it
-        # takes plain qmv, not qmv_fast, so under "2" all its row counts must
-        # fall through to the upstream route: the same bits as under "0".
+        # Shapes all pass the gate (K a multiple of 128, K and N at least 512,
+        # N a multiple of 16, N * K at least 2^21). One row takes qmv_fast at
+        # K = 4096 and 512 (both bits), and at K = 768 with 8 bits (the
+        # qmv_fast K step is 512 at 4 bits, 256 at 8); it takes plain qmv at
+        # K = 1152 and 1664 (both bits) and at K = 768 with 4 bits.
         #
         # The variable is read once per process, so each setting runs in its
-        # own interpreter. On NAX GPUs the route gate is off and "2" is the
-        # upstream route; the test then skips.
+        # own interpreter. On NAX GPUs the gate is off and "2" is the upstream
+        # route; the test then skips.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
         # Mirrors metal::is_nax_available() as in test_qmm_small_m_mma1_bit_equal.
@@ -943,7 +954,7 @@ print(" ".join([first] + [row0(M) for M in (1, 2, 4, 8, 16)]))
                 self.skipTest(
                     "NAX GPU: the small-M route gate is off, so "
                     "MLX_METAL_SMALL_M_ROW_INVARIANT=2 takes the upstream route; "
-                    "affine_qmv_fast_rows was NOT exercised here"
+                    "the stock-order 2-row and qmv_mma paths were NOT exercised"
                 )
         child = r"""
 import hashlib, json
@@ -952,6 +963,8 @@ import mlx.core as mx
 mx.random.seed(2)
 def bits_of(a):
     return mx.view(a, mx.uint32 if a.dtype == mx.float32 else mx.uint16)
+def same(a, b):
+    return mx.array_equal(bits_of(a), bits_of(b)).item()
 def digest(a):
     a = bits_of(a)
     mx.eval(a)
@@ -962,10 +975,11 @@ def pow2(lo, hi, shape):
     return mx.power(2.0, mx.random.randint(lo, hi, shape).astype(mx.float32))
 res = {}
 for (K, N), bits, gs, dtype in product(
-    [(4096, 4096), (4096, 1024), (512, 4096), (4096, 8192), (1152, 2048)],
+    [(4096, 4096), (4096, 1024), (512, 4096), (768, 4096), (1152, 2048),
+     (1664, 2048)],
     [4, 8],
     [32, 64, 128],
-    [mx.float16, mx.float32],
+    [mx.float16, mx.bfloat16, mx.float32],
 ):
     w_shape = (N, K * bits // 32)
     w_q = mx.bitwise_or(
@@ -982,11 +996,15 @@ for (K, N), bits, gs, dtype in product(
             v, w_q, scales, biases, transpose=True, group_size=gs, bits=bits
         )
     alone = mx.concatenate([qmm(x[i : i + 1]) for i in range(16)])
+    full = qmm(x)
     entry = {"1": digest(alone)}
-    for M in (2, 3, 4, 8, 9, 16):
+    for i in (0, 7):
+        out = qmm(x[i : i + 2])
+        entry[f"2@{i}"] = [digest(out), same(out, alone[i : i + 2])]
+    for M in (3, 4, 8, 9):
         out = qmm(x[:M])
-        equal = mx.array_equal(bits_of(out), bits_of(alone[:M])).item()
-        entry[str(M)] = [digest(out), equal]
+        entry[str(M)] = [digest(out), same(out, full[:M]), same(out, alone[:M])]
+    entry["16"] = [digest(full), True, same(full, alone)]
     res[f"{K}x{N} bits={bits} gs={gs} {dtype}"] = entry
 print(json.dumps(res))
 """
@@ -1005,24 +1023,29 @@ print(json.dumps(res))
 
         stock = run("2")
         upstream = run("0")
+        default = run("1")
         self.assertEqual(stock.keys(), upstream.keys())
+        self.assertEqual(stock.keys(), default.keys())
+        batched = ("3", "4", "8", "9", "16")
         for key, entry in stock.items():
             # One row takes the upstream route under "2".
             with self.subTest(case=key, M=1):
                 self.assertEqual(entry["1"], upstream[key]["1"])
-            if key.startswith("1152x2048"):
-                # Not a qmv_fast shape: every row count falls through.
-                with self.subTest(case=key, fall_through=True):
-                    self.assertEqual(entry, upstream[key])
-                continue
-            for M in ("2", "3", "4", "8", "9", "16"):
+            # Two rows: each equals that row alone.
+            for pair in ("2@0", "2@7"):
+                with self.subTest(case=key, M=pair):
+                    self.assertTrue(entry[pair][1])
+            # 3..16 rows: each row equals the same row of the 16-row product,
+            # and the products are the default route's (qmv_mma).
+            for M in batched:
                 with self.subTest(case=key, M=M):
                     self.assertTrue(entry[M][1])
-        witness = [k for k in upstream if k.startswith("4096x8192")]
+                    self.assertEqual(entry[M][0], default[key][M][0])
         self.assertTrue(
-            any(not upstream[k]["16"][1] for k in witness),
-            "16 rows of 4096x8192 matched the lone rows on the upstream route "
-            "too, so this run does not show that affine_qmv_fast_rows ran",
+            any(not entry["3"][2] for entry in stock.values()),
+            "every row of every 3-row product under MLX_METAL_SMALL_M_ROW_INVARIANT=2 "
+            "matched the lone rows, so this run does not show that the gate was on "
+            "and that the 2-row calls avoided qmv_mma",
         )
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
