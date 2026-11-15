@@ -720,9 +720,11 @@ inline bool use_affine_qmv_mma(
 
 // macprovider: WK, the number of K partial sums of the qmv_mma reduction, for
 // both qmv_mma and qmv_mma1 (see affine_qmv_mma1 in kernels/quantized.h).
-// The default is 8 on generation 13 and 15 GPUs and 4 elsewhere;
-// MLX_METAL_QMV_MMA_WK = 4, 8 or 16 overrides it (any other value keeps the
-// default). Measured on an M3 Ultra (generation 15), every quantized linear
+// The default is 8 on the stock-order route (small_m_route() == 2) on
+// generation 13 and 15 GPUs, and 4 everywhere else: the row-invariant route
+// keeps 4 on every GPU, so its bits are the ones native MTP and the other
+// row-invariant processes were qualified on. MLX_METAL_QMV_MMA_WK = 4, 8 or
+// 16 overrides the default (any other value keeps it). Measured on an M3 Ultra (generation 15), every quantized linear
 // of a 4-bit model chained once per pass, ms per pass at 1 / 2 / 4 / 8 / 16
 // rows: Llama 3.1 8B 10.45 / 13.69 / 13.80 / 13.93 / 23.01 at WK 4 against
 // 9.68 / 12.91 / 12.93 / 13.03 / 22.08 at WK 8; a 27B model 31.93 / 40.76 /
@@ -739,7 +741,8 @@ inline bool use_affine_qmv_mma(
 inline int qmv_mma_wk(metal::Device& d) {
   static const int wk = [&d] {
     const int gen = d.get_architecture_gen();
-    const int fallback = (gen == 13 || gen == 15) ? 8 : 4;
+    const int fallback =
+        (small_m_route() == 2 && (gen == 13 || gen == 15)) ? 8 : 4;
     int v = env::get_var("MLX_METAL_QMV_MMA_WK", fallback);
     return (v == 4 || v == 8 || v == 16) ? v : fallback;
   }();
