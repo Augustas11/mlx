@@ -677,15 +677,24 @@ inline bool use_affine_qmv_mma(
 
 // macprovider: WK, the number of K partial sums of the qmv_mma reduction, for
 // both qmv_mma and qmv_mma1 (see affine_qmv_mma1 in kernels/quantized.h).
-// MLX_METAL_QMV_MMA_WK takes 4 (the default), 8 or 16; any other value means
-// 4. Lab switch: 8 and 16 have NOT been measured or bit-verified yet. WK
-// changes the reduction order and so the bits of every output, so it is read
-// once per process, at the first product that takes the qmv_mma route, and
-// both kernels use that value for every call after it.
-inline int qmv_mma_wk() {
-  static const int wk = [] {
-    int v = env::get_var("MLX_METAL_QMV_MMA_WK", 4);
-    return (v == 8 || v == 16) ? v : 4;
+// The default is 8 on generation 15 GPUs and 4 elsewhere;
+// MLX_METAL_QMV_MMA_WK = 4, 8 or 16 overrides it (any other value keeps the
+// default). Measured on an M3 Ultra (generation 15), every quantized linear
+// of a 4-bit model chained once per pass, ms per pass at 1 / 2 / 4 / 8 / 16
+// rows: Llama 3.1 8B 10.45 / 13.69 / 13.80 / 13.93 / 23.01 at WK 4 against
+// 9.68 / 12.91 / 12.93 / 13.03 / 22.08 at WK 8; a 27B model 31.93 / 40.76 /
+// 40.75 / 40.98 / 81.70 against 30.42 / 39.05 / 39.18 / 39.46 / 79.45.
+// WK 16 was slower than 8 at one row on the 27B model. Other generations
+// that take this route were not measured and keep 4. A row alone and the
+// same row in a batch gave the same bits at 4, 8 and 16 on that GPU (the
+// small-M tests). WK changes the reduction order and so the bits of every
+// output, so it is fixed once per process, at the first product that takes
+// the qmv_mma route, and both kernels use that value for every call after.
+inline int qmv_mma_wk(metal::Device& d) {
+  static const int wk = [&d] {
+    const int fallback = (d.get_architecture_gen() == 15) ? 8 : 4;
+    int v = env::get_var("MLX_METAL_QMV_MMA_WK", fallback);
+    return (v == 4 || v == 8 || v == 16) ? v : fallback;
   }();
   return wk;
 }
@@ -707,7 +716,7 @@ void qmv_mma(
   // wk sets a row's K reduction order and must match qmv_mma1; the row
   // tiling never changes it, tm and bn only pick how many rows and columns
   // one threadgroup covers. The threadgroup is 32 wk threads (at most 512).
-  const int wk = qmv_mma_wk();
+  const int wk = qmv_mma_wk(d);
   int tm = (M > 8) ? 2 : 1;
   int bn = 16;
   // Below gen 15, affine with one row tile is faster at 32 columns (M2 Pro).
@@ -780,7 +789,7 @@ void qmv_mma1(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  const int wk = qmv_mma_wk();
+  const int wk = qmv_mma_wk(d);
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
