@@ -720,22 +720,26 @@ inline bool use_affine_qmv_mma(
 
 // macprovider: WK, the number of K partial sums of the qmv_mma reduction, for
 // both qmv_mma and qmv_mma1 (see affine_qmv_mma1 in kernels/quantized.h).
-// The default is 8 on generation 15 GPUs and 4 elsewhere;
+// The default is 8 on generation 13 and 15 GPUs and 4 elsewhere;
 // MLX_METAL_QMV_MMA_WK = 4, 8 or 16 overrides it (any other value keeps the
 // default). Measured on an M3 Ultra (generation 15), every quantized linear
 // of a 4-bit model chained once per pass, ms per pass at 1 / 2 / 4 / 8 / 16
 // rows: Llama 3.1 8B 10.45 / 13.69 / 13.80 / 13.93 / 23.01 at WK 4 against
 // 9.68 / 12.91 / 12.93 / 13.03 / 22.08 at WK 8; a 27B model 31.93 / 40.76 /
 // 40.75 / 40.98 / 81.70 against 30.42 / 39.05 / 39.18 / 39.46 / 79.45.
-// WK 16 was slower than 8 at one row on the 27B model. Other generations
-// that take this route were not measured and keep 4. A row alone and the
+// WK 16 was slower than 8 at one row on the 27B model. On an M1 (generation
+// 13, 8 GB) the same benchmark on a 3B model gave 34.73 / 40.45 / 52.19 /
+// 61.58 at 1 / 2 / 4 / 8 rows with WK 4 against 32.60 / 41.18 / 42.06 /
+// 53.64 with WK 8 (one run per cell). Other generations that take this
+// route (14, 16, and non-NAX 17) were not measured and keep 4. A row alone and the
 // same row in a batch gave the same bits at 4, 8 and 16 on that GPU (the
 // small-M tests). WK changes the reduction order and so the bits of every
 // output, so it is fixed once per process, at the first product that takes
 // the qmv_mma route, and both kernels use that value for every call after.
 inline int qmv_mma_wk(metal::Device& d) {
   static const int wk = [&d] {
-    const int fallback = (d.get_architecture_gen() == 15) ? 8 : 4;
+    const int gen = d.get_architecture_gen();
+    const int fallback = (gen == 13 || gen == 15) ? 8 : 4;
     int v = env::get_var("MLX_METAL_QMV_MMA_WK", fallback);
     return (v == 4 || v == 8 || v == 16) ? v : fallback;
   }();
