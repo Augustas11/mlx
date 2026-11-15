@@ -661,10 +661,13 @@ class TestQuantized(mlx_tests.MLXTestCase):
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_small_m_batch_invariant(self):
         # Continuous batching needs every row of a small-M product to match the
-        # same row computed alone, bit for bit. On non-NAX GPUs the first three
+        # same row computed alone, bit for bit. On non-NAX GPUs the first five
         # shapes take the qmv_mma reduction up to 16 rows: the row computed
         # alone runs qmv_mma1, the batches of 2 to 16 rows run qmv_mma, and
-        # the two kernels must give the same bits. (512, 256)
+        # the two kernels must give the same bits. With WK partial sums
+        # (MLX_METAL_QMV_MMA_WK, 4 by default) K = 512 has fewer 128-wide K
+        # blocks than partials at WK = 8 and 16, and K = 1152 and 1664 (9 and
+        # 13 blocks) leave the partials uneven at every WK. (512, 256)
         # misses that window (N < 512) and takes qmv below the qmm route. The
         # K = 2880 shapes (not a multiple of 128, as in gpt-oss, router
         # included) take qmv_wide on gen 15 and 16 GPUs and qmv elsewhere;
@@ -683,6 +686,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
             (2048, 1024, [2, 3, 4, 8, 16]),
             (4096, 4096, [2, 3, 4, 8, 16]),
             (512, 4096, [2, 3, 4, 8, 16]),
+            (1152, 2048, [2, 3, 4, 8, 16]),
+            (1664, 2048, [2, 3, 4, 8, 16]),
             (512, 256, [2, 3, 4, 8]),
             (2880, 4096, [2, 3, 4, 5, 6, 8, 9]),
             (2880, 512, [2, 3, 4, 5, 6, 8, 9]),
@@ -737,8 +742,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # over about ten binades each, where a different summation order shows
         # up in most elements.
         #
-        # 1664 = 13 * 128, so the four partial sums cover 4, 3, 3 and 3 K
-        # blocks.
+        # The kernels keep WK partial sums over 128-wide K blocks (4 by
+        # default, 8 or 16 with MLX_METAL_QMV_MMA_WK). 1664 = 13 * 128 and
+        # 1152 = 9 * 128 split unevenly at every WK: at WK = 4 the partials
+        # cover 4, 3, 3, 3 and 3, 2, 2, 2 blocks; at WK = 16 some partials get
+        # no block at all.
         #
         # On NAX GPUs the route is off and all these row counts take qmv. The
         # assertions still run there, but they compare qmv with itself and
@@ -772,7 +780,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
         rows = 9
         for (K, N), bits, gs, dtype, kind in product(
-            [(4096, 4096), (4096, 1024), (1664, 2048)],
+            [(4096, 4096), (4096, 1024), (1664, 2048), (1152, 2048)],
             [4, 8],
             [32, 64, 128],
             [mx.float32, mx.float16, mx.bfloat16],

@@ -675,6 +675,21 @@ inline bool use_affine_qmv_mma(
       (int64_t(N) * K >= (int64_t(1) << 21)) && (N % 16 == 0);
 }
 
+// macprovider: WK, the number of K partial sums of the qmv_mma reduction, for
+// both qmv_mma and qmv_mma1 (see affine_qmv_mma1 in kernels/quantized.h).
+// MLX_METAL_QMV_MMA_WK takes 4 (the default), 8 or 16; any other value means
+// 4. Lab switch: 8 and 16 have NOT been measured or bit-verified yet. WK
+// changes the reduction order and so the bits of every output, so it is read
+// once per process, at the first product that takes the qmv_mma route, and
+// both kernels use that value for every call after it.
+inline int qmv_mma_wk() {
+  static const int wk = [] {
+    int v = env::get_var("MLX_METAL_QMV_MMA_WK", 4);
+    return (v == 8 || v == 16) ? v : 4;
+  }();
+  return wk;
+}
+
 void qmv_mma(
     const array& x,
     const array& w,
@@ -689,9 +704,10 @@ void qmv_mma(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // wk and the row tiling never change a row's K reduction order; tm and bn
-  // only pick how many rows and columns one threadgroup covers.
-  constexpr int wk = 4;
+  // wk sets a row's K reduction order and must match qmv_mma1; the row
+  // tiling never changes it, tm and bn only pick how many rows and columns
+  // one threadgroup covers. The threadgroup is 32 wk threads (at most 512).
+  const int wk = qmv_mma_wk();
   int tm = (M > 8) ? 2 : 1;
   int bn = 16;
   // Below gen 15, affine with one row tile is faster at 32 columns (M2 Pro).
@@ -748,8 +764,8 @@ void qmv_mma(
 // 120 on qmv_mma1 against 146 on qmv_mma.
 constexpr int qmv_mma1_max_rows = 1;
 
-// One threadgroup per 8 output columns of one row; the grid height is the
-// row count. Any M works since a row never reads another row.
+// One threadgroup per 32 / wk output columns of one row; the grid height is
+// the row count. Any M works since a row never reads another row.
 void qmv_mma1(
     const array& x,
     const array& w,
@@ -764,13 +780,18 @@ void qmv_mma1(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
+  const int wk = qmv_mma_wk();
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
   concatenate(
       kname, mode, "_qmv_mma1_", type_string, "_gs_", group_size, "_b_", bits);
+  // wk = 4 keeps the kernel name it had before wk was a parameter.
+  if (wk != 4) {
+    concatenate(kname, "_wk_", wk);
+  }
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmv_mma1", mode, type_string, group_size, bits);
+      d, kname, "qmv_mma1", mode, type_string, group_size, bits, wk);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -785,7 +806,7 @@ void qmv_mma1(
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.dispatch_threadgroups(
-      MTL::Size(N / 8, M, 1), MTL::Size(32, 1, 1));
+      MTL::Size(N / (32 / wk), M, 1), MTL::Size(32, 1, 1));
 }
 
 void qvm_split_k(
@@ -2093,12 +2114,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int route_m = reference_prefill ? x.shape(-2) : M;
 
   // macprovider: rows below the qmm route take the qmv_mma reduction when the
-  // weight shape qualifies, from 1 row up: four partial sums over 128-wide K
-  // blocks, added in one fixed order. That is the one reduction order of the
-  // whole window, and two kernels implement it: qmv_mma1 for 1 row and
-  // qmv_mma (ml-explore/mlx#4787) for 2 rows and more. Both give the same bits
-  // for a row, so a row's result does not depend on how many rows share the
-  // call, and the switch point is a speed choice (qmv_mma1_max_rows). The
+  // weight shape qualifies, from 1 row up: WK partial sums over 128-wide K
+  // blocks, added in one fixed order (WK = 4 unless MLX_METAL_QMV_MMA_WK
+  // picks 8 or 16 for the process, see qmv_mma_wk). That is the one reduction
+  // order of the whole window, and two kernels implement it: qmv_mma1 for 1
+  // row and qmv_mma (ml-explore/mlx#4787) for 2 rows and more. Both give the
+  // same bits for a row, so a row's result does not depend on how many rows
+  // share the call, and the switch point is a speed choice (qmv_mma1_max_rows). The
   // weight test reads no row count, and the row limit is at least 17 so 1..16
   // rows always match bit for bit, where upstream would send rows from
   // vector_limit up to qmm. An unaligned or non-contiguous x is copied into

@@ -210,10 +210,15 @@ instantiate_quantized_all()
       bn,             \
       tm)
 
-#define instantiate_qmv_mma_all(type, group_size, bits)               \
-  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, 4, 16, 1) \
-  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, 4, 16, 2) \
-  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, 4, 32, 1)
+#define instantiate_qmv_mma_wk(type, group_size, bits, wk)               \
+  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, wk, 16, 1) \
+  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, wk, 16, 2) \
+  instantiate_qmv_mma(affine_qmv_mma, type, group_size, bits, wk, 32, 1)
+
+#define instantiate_qmv_mma_all(type, group_size, bits) \
+  instantiate_qmv_mma_wk(type, group_size, bits, 4)     \
+  instantiate_qmv_mma_wk(type, group_size, bits, 8)     \
+  instantiate_qmv_mma_wk(type, group_size, bits, 16)
 
 #define instantiate_qmv_mma_types(group_size, bits)       \
   instantiate_qmv_mma_all(float, group_size, bits)      \
@@ -228,10 +233,22 @@ instantiate_quantized_all()
 instantiate_qmv_mma_groups(4)
 instantiate_qmv_mma_groups(8)
 
-#define instantiate_qmv_mma1_types(group_size, bits)                    \
-  instantiate_quantized(affine_qmv_mma1, float, group_size, bits)      \
-  instantiate_quantized(affine_qmv_mma1, float16_t, group_size, bits)  \
-  instantiate_quantized(affine_qmv_mma1, bfloat16_t, group_size, bits)
+// WK = 4 keeps the name it had before WK was a parameter.
+#define instantiate_qmv_mma1(type, group_size, bits)                   \
+  instantiate_kernel(                                                  \
+      "affine_qmv_mma1_" #type "_gs_" #group_size "_b_" #bits,          \
+      affine_qmv_mma1, type, group_size, bits, 4)                      \
+  instantiate_kernel(                                                  \
+      "affine_qmv_mma1_" #type "_gs_" #group_size "_b_" #bits "_wk_8",  \
+      affine_qmv_mma1, type, group_size, bits, 8)                      \
+  instantiate_kernel(                                                  \
+      "affine_qmv_mma1_" #type "_gs_" #group_size "_b_" #bits "_wk_16", \
+      affine_qmv_mma1, type, group_size, bits, 16)
+
+#define instantiate_qmv_mma1_types(group_size, bits)       \
+  instantiate_qmv_mma1(float, group_size, bits)          \
+  instantiate_qmv_mma1(float16_t, group_size, bits)      \
+  instantiate_qmv_mma1(bfloat16_t, group_size, bits)
 
 #define instantiate_qmv_mma1_groups(bits) \
   instantiate_qmv_mma1_types(128, bits)   \
