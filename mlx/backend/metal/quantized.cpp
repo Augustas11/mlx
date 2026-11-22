@@ -1,5 +1,9 @@
 // Copyright © 2023-2026 Apple Inc.
 
+#include <algorithm>
+#include <cstdlib>
+#include <stdexcept>
+
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
@@ -670,6 +674,121 @@ void qmv_wide(
 // change inside a process would let state computed on one route continue on
 // the other. A per-call route is planned; until then the value holds for the
 // whole process.
+// macprovider lab (#2451), never set in production: a lab-only env var picks
+// a non-NAX matmul tile so a microbench can time tiles in one process.
+//   MLX_LAB_2451_QMM_TILE="bm,bk,bn"            dense qmm_t (WM = WN = 2)
+//   MLX_LAB_2451_GQMM_RHS_TILE="bm,bn,bk,wm,wn" gather_qmm_rhs, transposed
+// Unset, empty or the stock tile keeps the stock tile, kernel name and call.
+// It is read on every call (not cached) so a bench can switch between evals.
+// Only affine bfloat16 weights at group size 64 take an override (the tiles
+// are instantiated for those alone, quantized.metal); others keep the stock
+// tile. A value outside the instantiated set throws.
+// Every tile keeps one output element's reduction: steel BlockMMA::mma adds
+// 8-wide K fragments in ascending K into one float accumulator, whatever
+// BM, BN, BK, WM or WN is, and each tile starts at a multiple of 8 from the
+// row origin (qmm: tid.y * BM; gather: the expert's first row + j * BM).
+inline bool lab_2451_tile(const char* var, int n, int* out) {
+  const char* s = std::getenv(var);
+  if (s == nullptr || *s == '\0') {
+    return false;
+  }
+  int got = 0;
+  const char* p = s;
+  while (got < n) {
+    char* end = nullptr;
+    long v = std::strtol(p, &end, 10);
+    if (end == p || v <= 0 || v > 128) {
+      break;
+    }
+    out[got++] = static_cast<int>(v);
+    p = end;
+    if (*p == ',') {
+      p++;
+    } else {
+      break;
+    }
+  }
+  if (got != n || *p != '\0') {
+    std::ostringstream msg;
+    msg << "[" << var << "] expects " << n
+        << " comma-separated positive integers, got \"" << s << "\"";
+    throw std::invalid_argument(msg.str());
+  }
+  return true;
+}
+
+inline bool lab_2451_tile_type_ok(
+    const array& x,
+    const std::string& mode,
+    int group_size,
+    bool has_global_scale) {
+  return mode == "affine" && x.dtype() == bfloat16 && group_size == 64 &&
+      !has_global_scale;
+}
+
+// Dense qmm_t: true when an instantiated non-stock tile is selected.
+inline bool lab_2451_qmm_tile(int bits, int& bm, int& bk, int& bn) {
+  int t[3];
+  if (!lab_2451_tile("MLX_LAB_2451_QMM_TILE", 3, t)) {
+    return false;
+  }
+  if (t[0] == 32 && t[1] == 32 && t[2] == 32) {
+    return false;
+  }
+  static const int allowed[][3] = {
+      {64, 32, 64}, {64, 64, 64}, {32, 32, 64}, {64, 32, 32}, {32, 64, 32}};
+  for (auto& a : allowed) {
+    if (a[0] == t[0] && a[1] == t[1] && a[2] == t[2]) {
+      if (bits != 4 && bits != 6 && bits != 8) {
+        return false;
+      }
+      bm = t[0];
+      bk = t[1];
+      bn = t[2];
+      return true;
+    }
+  }
+  throw std::invalid_argument(
+      "[MLX_LAB_2451_QMM_TILE] bm,bk,bn must be one of 32,32,32 64,32,64 "
+      "64,64,64 32,32,64 64,32,32 32,64,32");
+}
+
+// gather_qmm_rhs: true when an instantiated non-stock tile is selected.
+inline bool
+lab_2451_gqmm_rhs_tile(int bits, int& bm, int& bn, int& bk, int& wm, int& wn) {
+  int t[5];
+  if (!lab_2451_tile("MLX_LAB_2451_GQMM_RHS_TILE", 5, t)) {
+    return false;
+  }
+  if (t[0] == 16 && t[1] == 32 && t[2] == 32 && t[3] == 1 && t[4] == 2) {
+    return false;
+  }
+  static const int allowed[][5] = {
+      {8, 32, 32, 1, 2},
+      {16, 64, 32, 1, 2},
+      {16, 32, 64, 1, 2},
+      {32, 32, 32, 2, 2},
+      {32, 64, 32, 2, 2},
+      {64, 64, 32, 2, 2}};
+  for (auto& a : allowed) {
+    if (std::equal(a, a + 5, t)) {
+      if (bits != 4 && bits != 8) {
+        return false;
+      }
+      bm = t[0];
+      bn = t[1];
+      bk = t[2];
+      wm = t[3];
+      wn = t[4];
+      return true;
+    }
+  }
+  throw std::invalid_argument(
+      "[MLX_LAB_2451_GQMM_RHS_TILE] bm,bn,bk,wm,wn must be one of "
+      "16,32,32,1,2 8,32,32,1,2 16,64,32,1,2 16,32,64,1,2 32,32,32,2,2 "
+      "32,64,32,2,2 64,64,32,2,2");
+}
+
 inline int small_m_route() {
   static const int route = [] {
     int v = env::get_var("MLX_METAL_SMALL_M_ROW_INVARIANT", 1);
@@ -1410,12 +1529,17 @@ void qmm(
   int wn = 2;
   int bm = 32;
   int bn = 32;
+  // macprovider lab (#2451): MLX_LAB_2451_QMM_TILE, see lab_2451_tile.
+  int lab_bk = 32;
+  const bool lab_tile = transpose &&
+      lab_2451_tile_type_ok(x, mode, group_size, global_scale.has_value()) &&
+      lab_2451_qmm_tile(bits, bm, lab_bk, bn);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
   std::string kname;
   kname.reserve(64);
-  bool aligned = N % 32 == 0;
+  bool aligned = N % bn == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
   concatenate(
@@ -1429,9 +1553,27 @@ void qmm(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0",
       global_scale ? "_hgs" : "");
+  if (lab_tile) {
+    concatenate(kname, "_bm_", bm, "_bk_", lab_bk, "_bn_", bn);
+  }
   std::string template_def;
   MTL::ComputePipelineState* kernel;
-  if (transpose) {
+  if (lab_tile) {
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "qmm_t",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        aligned,
+        batched,
+        false,
+        bm,
+        lab_bk,
+        bn);
+  } else if (transpose) {
     kernel = get_quantized_kernel_wrapped(
         d,
         kname,
@@ -2058,6 +2200,11 @@ void gather_qmm_rhs(
   int E = w.size() / w.shape(-1) / w.shape(-2);
   int bm = 16, bn = 32, bk = 32;
   int wm = 1, wn = 2;
+  // macprovider lab (#2451): MLX_LAB_2451_GQMM_RHS_TILE, see lab_2451_tile.
+  if (transpose &&
+      lab_2451_tile_type_ok(x, mode, group_size, global_scale.has_value())) {
+    lab_2451_gqmm_rhs_tile(bits, bm, bn, bk, wm, wn);
+  }
 
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;

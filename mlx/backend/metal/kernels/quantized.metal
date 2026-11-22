@@ -279,3 +279,46 @@ instantiate_qmv_mma1_groups(8)
 instantiate_qmv_fast_rows_types(128)
 instantiate_qmv_fast_rows_types(64)
 instantiate_qmv_fast_rows_types(32) // clang-format on
+
+// clang-format off
+// macprovider lab (#2451): the tiles MLX_LAB_2451_QMM_TILE and
+// MLX_LAB_2451_GQMM_RHS_TILE may select (quantized.cpp, lab_2451_tile),
+// affine bfloat16 at group size 64 only. The stock tiles above are unchanged.
+#define instantiate_lab_2451_qmm_t(bits, aligned, batched, bm, bk, bn)      \
+  instantiate_kernel(                                                       \
+      "affine_qmm_t_bfloat16_t_gs_64_b_" #bits "_alN_" #aligned "_batch_"   \
+      #batched "_bm_" #bm "_bk_" #bk "_bn_" #bn,                            \
+      affine_qmm_t, bfloat16_t, 64, bits, aligned, batched, false, bm, bk, bn)
+
+#define instantiate_lab_2451_qmm_t_tile(bits, bm, bk, bn)    \
+  instantiate_lab_2451_qmm_t(bits, true, 0, bm, bk, bn)      \
+  instantiate_lab_2451_qmm_t(bits, true, 1, bm, bk, bn)      \
+  instantiate_lab_2451_qmm_t(bits, false, 0, bm, bk, bn)     \
+  instantiate_lab_2451_qmm_t(bits, false, 1, bm, bk, bn)
+
+#define instantiate_lab_2451_qmm_t_bits(bits)          \
+  instantiate_lab_2451_qmm_t_tile(bits, 64, 32, 64)    \
+  instantiate_lab_2451_qmm_t_tile(bits, 64, 64, 64)    \
+  instantiate_lab_2451_qmm_t_tile(bits, 32, 32, 64)    \
+  instantiate_lab_2451_qmm_t_tile(bits, 64, 32, 32)    \
+  instantiate_lab_2451_qmm_t_tile(bits, 32, 64, 32)
+
+instantiate_lab_2451_qmm_t_bits(4)
+instantiate_lab_2451_qmm_t_bits(6)
+instantiate_lab_2451_qmm_t_bits(8)
+
+#define instantiate_lab_2451_rhs(bits, bm, bn, bk, wm, wn)                    \
+  instantiate_gather_qmm_rhs(affine_gather_qmm_rhs, affine_gather_qmm_rhs_nt, \
+      bfloat16_t, 64, bits, bm, bn, bk, wm, wn, true)
+
+#define instantiate_lab_2451_rhs_bits(bits)               \
+  instantiate_lab_2451_rhs(bits, 8, 32, 32, 1, 2)         \
+  instantiate_lab_2451_rhs(bits, 16, 64, 32, 1, 2)        \
+  instantiate_lab_2451_rhs(bits, 16, 32, 64, 1, 2)        \
+  instantiate_lab_2451_rhs(bits, 32, 32, 32, 2, 2)        \
+  instantiate_lab_2451_rhs(bits, 32, 64, 32, 2, 2)        \
+  instantiate_lab_2451_rhs(bits, 64, 64, 32, 2, 2)
+
+instantiate_lab_2451_rhs_bits(4)
+instantiate_lab_2451_rhs_bits(8)
+// clang-format on
