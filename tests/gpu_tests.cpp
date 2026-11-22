@@ -1,9 +1,11 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <string>
@@ -1107,5 +1109,69 @@ TEST_CASE("test gpu small-M compiled function under two routes") {
       }
     }
     CHECK_EQ(traces, 3 * 3 + 3 * 2); // 3 direct calls and 2 traces per M.
+  }
+}
+
+TEST_CASE("test gpu qmm 64-row tile bit identity") {
+  // macprovider (#2451): from 1024 rows the transposed dense qmm of affine
+  // bfloat16 weights at group size 64 and 4, 6 or 8 bits takes a 64-row tile
+  // instead of the stock 32 (metal::qmm_t_block_rows, quantized.cpp). The
+  // tile must not change any output bit: every row of a 1024..4096-row product
+  // on the 64-row tile equals that row computed in 512-row chunks, which stay
+  // on the stock 32-row tile. 3673 rows (a real prompt length) ends in a
+  // partial tile. Shapes: GLM-5.3-Flash's dense MLP (N 4096, K 12288 and
+  // N 12288, K 4096), 8 and 4 bits. NAX GPUs run qmm_nax, not this tile.
+  if (small_m_route_gate_off()) {
+    MESSAGE("NAX GPU: the dense qmm tile does not run, test skipped");
+    return;
+  }
+  // Read once per process by the tile choice: set, the test would compare the
+  // stock tile with itself.
+  const char* stock = std::getenv("MLX_METAL_QMM_STOCK_TILE");
+  REQUIRE_MESSAGE(
+      (stock == nullptr || std::string(stock).empty() ||
+       std::string(stock) == "0"),
+      "MLX_METAL_QMM_STOCK_TILE is set: unset it to test the 64-row tile");
+  constexpr int chunk = 512;
+  constexpr int gs = 64;
+  const std::array<std::pair<int, int>, 2> shapes = {
+      std::pair<int, int>{4096, 12288}, std::pair<int, int>{12288, 4096}};
+  const std::array<int, 4> row_counts = {1024, 2048, 3673, 4096};
+
+  random::seed(0);
+  for (auto [N, K] : shapes) {
+    for (int bits : {8, 4}) {
+      auto w = astype(random::normal({N, K}), bfloat16);
+      auto q = quantize(w, gs, bits);
+      auto x_all = astype(
+          random::normal({row_counts.back(), K}) /
+              std::sqrt(static_cast<float>(K)),
+          bfloat16);
+      eval(q);
+      eval(x_all);
+      auto qmm = [&](const array& v) {
+        return quantized_matmul(v, q[0], q[1], q[2], true, gs, bits);
+      };
+      CHECK_EQ(metal::qmm_t_block_rows(true, gs, bits, chunk), 32);
+      for (int M : row_counts) {
+        CAPTURE(N);
+        CAPTURE(K);
+        CAPTURE(bits);
+        CAPTURE(M);
+        REQUIRE_EQ(metal::qmm_t_block_rows(true, gs, bits, M), 64);
+        auto x = slice(x_all, {0, 0}, {M, K});
+        std::vector<array> parts;
+        for (int r = 0; r < M; r += chunk) {
+          parts.push_back(qmm(slice(x, {r, 0}, {std::min(r + chunk, M), K})));
+        }
+        auto expected = concatenate(parts, 0);
+        auto got = qmm(x);
+        eval(expected, got);
+        CHECK(array_equal(got, expected).item<bool>());
+        // A [1, M, K] prefill batch takes the same tile (M rows, one batch).
+        auto got3 = reshape(qmm(reshape(x, {1, M, K})), {M, N});
+        CHECK(array_equal(got3, expected).item<bool>());
+      }
+    }
   }
 }

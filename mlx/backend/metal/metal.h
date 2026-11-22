@@ -32,4 +32,12 @@ MLX_API const std::string& get_metallib_path();
  * this process's GPU. quantized_matmul captures it per op. */
 int qmv_mma_partial_sums(int route);
 
+/* macprovider: internal. The row tile (BM) of the transposed dense qmm kernel
+ * (affine_qmm_t, GPUs without NAX) for an M-row product: 64 for affine
+ * bfloat16 weights at group size 64 and 4, 6 or 8 bits from 1024 rows, else
+ * the stock 32 (see qmm in quantized.cpp). MLX_METAL_QMM_STOCK_TILE=1, read
+ * once per process, keeps 32 for every product. */
+MLX_API int
+qmm_t_block_rows(bool affine_bfloat16, int group_size, int bits, int M);
+
 } // namespace mlx::core::metal

@@ -279,3 +279,23 @@ instantiate_qmv_mma1_groups(8)
 instantiate_qmv_fast_rows_types(128)
 instantiate_qmv_fast_rows_types(64)
 instantiate_qmv_fast_rows_types(32) // clang-format on
+
+// clang-format off
+// macprovider (#2451): the 64-row dense qmm_t tile (BM 64, BK 32, BN 32) that
+// qmm selects for affine bfloat16 weights at group size 64 and 4, 6 or 8 bits
+// from 1024 rows (qmm_t_block_rows, quantized.cpp).
+#define instantiate_qmm_t_bm64(bits, aligned, batched)                    \
+  instantiate_kernel(                                                     \
+      "affine_qmm_t_bfloat16_t_gs_64_b_" #bits "_alN_" #aligned "_batch_" \
+      #batched "_bm_64_bk_32_bn_32",                                      \
+      affine_qmm_t, bfloat16_t, 64, bits, aligned, batched, false, 64, 32, 32)
+
+#define instantiate_qmm_t_bm64_bits(bits)    \
+  instantiate_qmm_t_bm64(bits, true, 0)      \
+  instantiate_qmm_t_bm64(bits, true, 1)      \
+  instantiate_qmm_t_bm64(bits, false, 0)     \
+  instantiate_qmm_t_bm64(bits, false, 1)
+
+instantiate_qmm_t_bm64_bits(4)
+instantiate_qmm_t_bm64_bits(6)
+instantiate_qmm_t_bm64_bits(8) // clang-format on

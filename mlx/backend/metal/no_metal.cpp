@@ -27,6 +27,10 @@ int qmv_mma_partial_sums(int) {
   return 4;
 }
 
+int qmm_t_block_rows(bool, int, int, int) {
+  return 32;
+}
+
 const std::string& get_metallib_path() {
   throw std::runtime_error(
       "[metal::get_metallib_path] Cannot get metallib path without metal backend");

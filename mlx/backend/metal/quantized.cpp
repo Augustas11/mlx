@@ -1364,6 +1364,35 @@ void gather_qmm_nax(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// macprovider (#2451): the dense transposed qmm takes a 64-row tile (BM = 64,
+// BK = 32, BN = 32, WM = WN = 2) instead of the stock 32 rows for affine
+// bfloat16 weights at group size 64 and 4, 6 or 8 bits, from
+// qmm_t_bm64_min_rows rows (prefill chunks). On an M3 Ultra the GLM-5.3-Flash
+// dense prefill shapes (6 and 8 bits) ran 5.21% faster count-weighted at 2048
+// and 4096 rows against both neighbouring stock controls, and GLM prefill TTFT
+// fell 1.2-1.5% at 3,673 and 14,126 prompt tokens with identical greedy tokens.
+// Products under 1024 rows were not measured and keep the stock tile.
+// The tile never changes an output's bits: steel BlockMMA::mma adds the
+// 8-wide K fragments of one output in ascending K into one float accumulator
+// whatever BM is, BK (the K step and the loaders) is unchanged, and every row
+// tile starts at a multiple of 8 rows (tid.y * BM), so a row sits at the same
+// place in its 8x8 fragment under both tiles. The row-count switch therefore
+// keeps rows batch-invariant ("test gpu qmm 64-row tile bit identity").
+// MLX_METAL_QMM_STOCK_TILE=1 restores the stock tile for every product. It is
+// read once per process.
+constexpr int qmm_t_bm64_min_rows = 1024;
+
+int metal::qmm_t_block_rows(
+    bool affine_bfloat16,
+    int group_size,
+    int bits,
+    int M) {
+  static const bool stock = env::get_var("MLX_METAL_QMM_STOCK_TILE", 0) != 0;
+  const bool tiled = !stock && affine_bfloat16 && group_size == 64 &&
+      (bits == 4 || bits == 6 || bits == 8) && M >= qmm_t_bm64_min_rows;
+  return tiled ? 64 : 32;
+}
+
 void qmm(
     const array& x,
     const array& w,
@@ -1411,14 +1440,19 @@ void qmm(
 
   int wm = 2;
   int wn = 2;
-  int bm = 32;
+  // macprovider (#2451): 64 rows per tile in the measured envelope, see
+  // qmm_t_block_rows. The grid's row count and the kernel's BM follow bm.
+  int bm = (transpose && !global_scale)
+      ? metal::qmm_t_block_rows(
+            mode == "affine" && x.dtype() == bfloat16, group_size, bits, M)
+      : 32;
   int bn = 32;
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
   std::string kname;
   kname.reserve(64);
-  bool aligned = N % 32 == 0;
+  bool aligned = N % bn == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
   concatenate(
@@ -1432,9 +1466,27 @@ void qmm(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0",
       global_scale ? "_hgs" : "");
+  if (bm != 32) {
+    concatenate(kname, "_bm_", bm, "_bk_32_bn_", bn);
+  }
   std::string template_def;
   MTL::ComputePipelineState* kernel;
-  if (transpose) {
+  if (bm != 32) {
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "qmm_t",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        aligned,
+        batched,
+        false,
+        bm,
+        32,
+        bn);
+  } else if (transpose) {
     kernel = get_quantized_kernel_wrapped(
         d,
         kname,
