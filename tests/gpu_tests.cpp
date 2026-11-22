@@ -906,6 +906,15 @@ static std::vector<SmallMRouteCase> small_m_route_cases() {
   return cases;
 }
 
+// The discriminating case of the two-route tests: 2 rows of a K = 4096 weight
+// take qmv_fast_rows (each row in qmv_fast's order) on stock_order and
+// qmv_mma at WK 4 (128-wide K blocks in 4 partials) on row_invariant. The two
+// orders round differently across 2 x N outputs, so the routes' bits must
+// differ there; were they equal, the per-route checks would pass vacuously.
+static bool small_m_routes_must_differ(const SmallMRouteCase& c, int M) {
+  return M == 2 && c.K == 4096;
+}
+
 // Every row of rows[0..M) computed alone under the active scope.
 static array small_m_alone(
     const array& x,
@@ -1037,6 +1046,9 @@ TEST_CASE("test gpu small-M two routes in one graph") {
         b = qmm();
         eval(a, b);
       }
+      if (small_m_routes_must_differ(c, M)) {
+        REQUIRE_FALSE(array_equal(ref_ri, ref_so).item<bool>());
+      }
       CHECK(array_equal(a, ref_ri).item<bool>());
       CHECK(array_equal(b, ref_so).item<bool>());
     }
@@ -1074,6 +1086,7 @@ TEST_CASE("test gpu small-M compiled function under two routes") {
       CAPTURE(M);
       auto rows = slice(x, {0, 0}, {M, c.K});
       std::vector<array> in = {rows, q[0], q[1], q[2]};
+      std::vector<array> refs;
       for (int route :
            {small_m_route_row_invariant,
             small_m_route_stock_order,
@@ -1084,6 +1097,13 @@ TEST_CASE("test gpu small-M compiled function under two routes") {
         auto out = cfun(in)[0];
         eval(ref, out);
         CHECK(array_equal(out, ref).item<bool>());
+        refs.push_back(ref);
+      }
+      if (small_m_routes_must_differ(c, M)) {
+        // The row_invariant and stock_order references differ, so the
+        // compiled outputs above came from two traces, one per route.
+        REQUIRE_FALSE(array_equal(refs[0], refs[1]).item<bool>());
+        CHECK(array_equal(refs[0], refs[2]).item<bool>());
       }
     }
     CHECK_EQ(traces, 3 * 3 + 3 * 2); // 3 direct calls and 2 traces per M.
