@@ -17,6 +17,7 @@
 #include "mlx/fast_primitives.h"
 #include "mlx/graph_utils.h"
 #include "mlx/primitives.h"
+#include "mlx/small_m_route.h"
 #include "mlx/transforms.h"
 #include "mlx/transforms_impl.h"
 #include "mlx/utils.h"
@@ -303,10 +304,16 @@ std::uintptr_t get_function_address(const std::function<T(U...)>& fun) {
 class CompileCache {
  public:
   struct CacheEntry {
-    CacheEntry(std::optional<Stream> stream, bool shapeless)
-        : stream(stream), shapeless(shapeless) {}
+    CacheEntry(std::optional<Stream> stream, bool shapeless, int small_m_route)
+        : stream(stream),
+          shapeless(shapeless),
+          small_m_route(small_m_route) {}
     std::optional<Stream> stream;
     bool shapeless;
+    // macprovider: the small-row route in effect when the trace was recorded.
+    // Each QuantizedMatmul captures the route at graph build, so a trace holds
+    // one route's ops; a call under another route needs its own trace.
+    int small_m_route;
     std::vector<array> inputs;
     std::vector<array> outputs;
     std::vector<array> tape;
@@ -372,12 +379,16 @@ class CompileCache {
     // - Default stream and device match the entry's default stream
     // - Inputs match i.e. shapes and types must be equal.
     auto stream = peek_default_stream(default_device());
+    int route = small_m_route();
     for (CacheEntry& entry : entries) {
       // Check that the default stream and device match
       if (entry.stream != stream) {
         continue;
       }
       if (entry.shapeless != shapeless) {
+        continue;
+      }
+      if (entry.small_m_route != route) {
         continue;
       }
 
@@ -388,7 +399,7 @@ class CompileCache {
       }
     }
     // Otherwise append a new cache entry
-    entries.push_back(CacheEntry{stream, shapeless});
+    entries.push_back(CacheEntry{stream, shapeless, route});
     return {entries.back(), std::move(entries_ptr)};
   }
 

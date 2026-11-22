@@ -1643,13 +1643,17 @@ class QuantizedMatmul : public UnaryPrimitive {
       int bits,
       QuantizationMode mode,
       bool transpose,
-      bool reference_prefill = false)
+      bool reference_prefill = false,
+      int small_m_route = 1,
+      int qmv_mma_wk = 0)
       : UnaryPrimitive(stream),
         group_size_(group_size),
         bits_(bits),
         mode_(mode),
         transpose_(transpose),
-        reference_prefill_(reference_prefill) {}
+        reference_prefill_(reference_prefill),
+        small_m_route_(small_m_route),
+        qmv_mma_wk_(qmv_mma_wk) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -1661,7 +1665,13 @@ class QuantizedMatmul : public UnaryPrimitive {
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
   auto state() const {
     return std::make_tuple(
-        group_size_, bits_, mode_, transpose_, reference_prefill_);
+        group_size_,
+        bits_,
+        mode_,
+        transpose_,
+        reference_prefill_,
+        small_m_route_,
+        qmv_mma_wk_);
   }
 
  private:
@@ -1670,6 +1680,12 @@ class QuantizedMatmul : public UnaryPrimitive {
   QuantizationMode mode_;
   bool transpose_;
   bool reference_prefill_;
+  // macprovider: the small-row route (small_m_route.h) and the qmv_mma
+  // partial-sum count, captured when quantized_matmul builds the op, so the
+  // op keeps them whatever route scope is active when it is evaluated.
+  // qmv_mma_wk_ is 0 where no Metal qmv_mma kernel can run the op.
+  int small_m_route_;
+  int qmv_mma_wk_;
 };
 
 class QQMatmul : public UnaryPrimitive {

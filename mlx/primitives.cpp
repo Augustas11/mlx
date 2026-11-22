@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cmath>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -15,6 +16,7 @@
 #include "mlx/linalg.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
+#include "mlx/small_m_route.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
@@ -3605,6 +3607,11 @@ std::vector<array> QuantizedMatmul::vjp(
   for (auto arg : argnums) {
     // gradient wrt to x
     if (arg == 0) {
+      // The derived product keeps this op's small-row route.
+      std::optional<ScopedSmallMRoute> route;
+      if (small_m_route_ != small_m_route_serial_only) {
+        route.emplace(small_m_route_);
+      }
       vjps.push_back(quantized_matmul(
           cotangents[0],
           primals[1],
@@ -3670,6 +3677,11 @@ std::vector<array> QuantizedMatmul::jvp(
     throw std::runtime_error(
         "[QuantizedMatmul::jvp] No JVP wrt the quantized matrix yet.");
   }
+  // The derived product keeps this op's small-row route.
+  std::optional<ScopedSmallMRoute> route;
+  if (small_m_route_ != small_m_route_serial_only) {
+    route.emplace(small_m_route_);
+  }
   return {quantized_matmul(
       tangents[0],
       primals[1],
@@ -3688,7 +3700,9 @@ bool QuantizedMatmul::is_equivalent(const Primitive& other) const {
   const QuantizedMatmul& qm_other = static_cast<const QuantizedMatmul&>(other);
   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
       mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_ &&
-      reference_prefill_ == qm_other.reference_prefill_;
+      reference_prefill_ == qm_other.reference_prefill_ &&
+      small_m_route_ == qm_other.small_m_route_ &&
+      qmv_mma_wk_ == qm_other.qmv_mma_wk_;
 }
 
 std::vector<Shape> QuantizedMatmul::output_shapes(
