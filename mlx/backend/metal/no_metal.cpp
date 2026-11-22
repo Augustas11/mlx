@@ -23,6 +23,10 @@ device_info() {
 
 void set_metallib_path(const std::string& path) {}
 
+int qmv_mma_partial_sums(int) {
+  return 4;
+}
+
 const std::string& get_metallib_path() {
   throw std::runtime_error(
       "[metal::get_metallib_path] Cannot get metallib path without metal backend");

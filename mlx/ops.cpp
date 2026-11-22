@@ -14,6 +14,7 @@
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
+#include "mlx/small_m_route.h"
 #include "mlx/transforms.h"
 #include "mlx/transforms_impl.h"
 #include "mlx/types/limits.h"
@@ -4982,11 +4983,21 @@ array quantized_matmul(
   }
   auto out_shape = inputs[0].shape();
   out_shape.back() = w_outer_dims;
+  // macprovider: capture the small-row route in effect on this thread and its
+  // qmv_mma partial-sum count now, at graph build, so the op keeps them
+  // whatever scope is active at evaluation (see small_m_route.h).
+  auto stream = to_stream(s);
+  int route = small_m_route();
+  int wk = (qmode == QuantizationMode::Affine &&
+            stream.device == Device::gpu && metal::is_available())
+      ? metal::qmv_mma_partial_sums(route)
+      : 0;
   return array(
       std::move(out_shape),
       dtype,
       std::make_shared<QuantizedMatmul>(
-          to_stream(s), group_size, bits, qmode, transpose, reference_prefill),
+          stream, group_size, bits, qmode, transpose, reference_prefill, route,
+          wk),
       std::move(inputs));
 }
 

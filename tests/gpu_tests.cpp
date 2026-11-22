@@ -1,9 +1,13 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <future>
+#include <string>
+#include <variant>
 
 #include "doctest/doctest.h"
 #include "mlx/mlx.h"
@@ -845,5 +849,243 @@ TEST_CASE("test gpu small-M quantized matmul batch invariance") {
         }
       }
     }
+  }
+}
+
+// macprovider: true where the small-row qmv_mma route never runs, mirroring
+// metal::is_nax_available() (mlx/backend/metal/device.cpp): gen 17 and up
+// (18 and up for "p" GPUs) on macOS 26.2 and up. On those GPUs the route
+// selects no different kernel, so the per-op route tests below skip.
+static bool small_m_route_gate_off() {
+  const auto& info = gpu::device_info();
+  auto it = info.find("architecture");
+  if (it == info.end()) {
+    return true;
+  }
+  const std::string arch = std::get<std::string>(it->second);
+  auto pos = arch.rfind("_g");
+  std::string digits;
+  for (size_t i = (pos == std::string::npos ? 0 : pos + 2); i < arch.size();
+       ++i) {
+    if (std::isdigit(static_cast<unsigned char>(arch[i]))) {
+      digits.push_back(arch[i]);
+    }
+  }
+  if (digits.empty()) {
+    return false;
+  }
+  bool os_ok = false;
+  if (__builtin_available(macOS 26.2, *)) {
+    os_ok = true;
+  }
+  return os_ok && std::stoi(digits) >= (arch.back() == 'p' ? 18 : 17);
+}
+
+// The shapes and settings the per-op route tests share: weights that pass the
+// qmv_mma gate (K % 128 == 0, N and K >= 512, N % 16 == 0, 4 or 8 bits), and
+// K = 4096 so both the qmv_fast_rows (K % 512 == 0) and the 2-row stock-order
+// path run. 1152 (not a multiple of 512 at 4 bits) takes the plain-qmv 2-row
+// stock-order path.
+struct SmallMRouteCase {
+  int K;
+  int N;
+  int bits;
+  int gs;
+  Dtype dtype;
+};
+static std::vector<SmallMRouteCase> small_m_route_cases() {
+  std::vector<SmallMRouteCase> cases;
+  for (auto [K, N] :
+       std::vector<std::pair<int, int>>{{4096, 1024}, {1152, 2048}}) {
+    for (int bits : {4, 8}) {
+      for (auto dtype : {float16, bfloat16}) {
+        cases.push_back({K, N, bits, 64, dtype});
+      }
+    }
+  }
+  return cases;
+}
+
+// Every row of rows[0..M) computed alone under the active scope.
+static array small_m_alone(
+    const array& x,
+    const std::vector<array>& q,
+    const SmallMRouteCase& c,
+    int M) {
+  std::vector<array> alone;
+  for (int i = 0; i < M; ++i) {
+    alone.push_back(quantized_matmul(
+        slice(x, {i, 0}, {i + 1, c.K}), q[0], q[1], q[2], true, c.gs, c.bits));
+  }
+  return concatenate(alone, 0);
+}
+
+TEST_CASE("test gpu small-M scoped row_invariant route") {
+  // Under a row_invariant scope every row of a 1/2/3/8/16-row product equals
+  // that row computed alone, bit for bit, as the process route 1 guarantees,
+  // whatever the process route is.
+  if (small_m_route_gate_off()) {
+    MESSAGE("NAX GPU: small-row route gate off, test skipped");
+    return;
+  }
+  random::seed(0);
+  ScopedSmallMRoute scope(small_m_route_row_invariant);
+  for (auto c : small_m_route_cases()) {
+    auto x = astype(
+        random::normal({16, c.K}) / std::sqrt(static_cast<float>(c.K)),
+        c.dtype);
+    auto q =
+        quantize(astype(random::normal({c.N, c.K}), c.dtype), c.gs, c.bits);
+    auto alone = small_m_alone(x, q, c, 16);
+    eval(alone);
+    for (int M : {1, 2, 3, 8, 16}) {
+      CAPTURE(c.K);
+      CAPTURE(c.N);
+      CAPTURE(c.bits);
+      CAPTURE(c.dtype);
+      CAPTURE(M);
+      auto out = quantized_matmul(
+          slice(x, {0, 0}, {M, c.K}), q[0], q[1], q[2], true, c.gs, c.bits);
+      CHECK(array_equal(out, slice(alone, {0, 0}, {M, c.N})).item<bool>());
+    }
+  }
+}
+
+TEST_CASE("test gpu small-M scoped stock_order route") {
+  // Under a stock_order scope a 2-row product equals each lone row bit for
+  // bit, and the rows of 3, 8 and 16-row products equal each other.
+  if (small_m_route_gate_off()) {
+    MESSAGE("NAX GPU: small-row route gate off, test skipped");
+    return;
+  }
+  random::seed(0);
+  ScopedSmallMRoute scope(small_m_route_stock_order);
+  for (auto c : small_m_route_cases()) {
+    CAPTURE(c.K);
+    CAPTURE(c.N);
+    CAPTURE(c.bits);
+    CAPTURE(c.dtype);
+    auto x = astype(
+        random::normal({16, c.K}) / std::sqrt(static_cast<float>(c.K)),
+        c.dtype);
+    auto q =
+        quantize(astype(random::normal({c.N, c.K}), c.dtype), c.gs, c.bits);
+    auto qmm = [&](int M) {
+      return quantized_matmul(
+          slice(x, {0, 0}, {M, c.K}), q[0], q[1], q[2], true, c.gs, c.bits);
+    };
+    auto alone = small_m_alone(x, q, c, 2);
+    auto two = qmm(2);
+    auto r16 = qmm(16);
+    eval(alone, two, r16);
+    CHECK(array_equal(two, alone).item<bool>());
+    for (int M : {3, 8}) {
+      CAPTURE(M);
+      CHECK(array_equal(qmm(M), slice(r16, {0, 0}, {M, c.N})).item<bool>());
+    }
+  }
+}
+
+TEST_CASE("test gpu small-M two routes in one graph") {
+  // Ops built under different scopes keep their own route when evaluated
+  // together, and simplify does not merge them even though they share every
+  // input and every other parameter.
+  if (small_m_route_gate_off()) {
+    MESSAGE("NAX GPU: small-row route gate off, test skipped");
+    return;
+  }
+  random::seed(0);
+  for (auto c : small_m_route_cases()) {
+    CAPTURE(c.K);
+    CAPTURE(c.N);
+    CAPTURE(c.bits);
+    CAPTURE(c.dtype);
+    auto x = astype(
+        random::normal({16, c.K}) / std::sqrt(static_cast<float>(c.K)),
+        c.dtype);
+    auto q =
+        quantize(astype(random::normal({c.N, c.K}), c.dtype), c.gs, c.bits);
+    for (int M : {2, 3, 8}) {
+      CAPTURE(M);
+      auto rows = slice(x, {0, 0}, {M, c.K});
+      auto qmm = [&]() {
+        return quantized_matmul(rows, q[0], q[1], q[2], true, c.gs, c.bits);
+      };
+      // References, each evaluated alone.
+      array ref_ri = array(0.0f);
+      array ref_so = array(0.0f);
+      {
+        ScopedSmallMRoute scope(small_m_route_row_invariant);
+        ref_ri = qmm();
+        eval(ref_ri);
+      }
+      {
+        ScopedSmallMRoute scope(small_m_route_stock_order);
+        ref_so = qmm();
+        eval(ref_so);
+      }
+      // One graph holding both routes; the scope at eval time is the
+      // opposite of the first op's to show evaluation does not read it.
+      array a = array(0.0f);
+      array b = array(0.0f);
+      {
+        ScopedSmallMRoute scope(small_m_route_row_invariant);
+        a = qmm();
+      }
+      {
+        ScopedSmallMRoute scope(small_m_route_stock_order);
+        b = qmm();
+        eval(a, b);
+      }
+      CHECK(array_equal(a, ref_ri).item<bool>());
+      CHECK(array_equal(b, ref_so).item<bool>());
+    }
+  }
+}
+
+TEST_CASE("test gpu small-M compiled function under two routes") {
+  // The same compiled function called under the two scopes keeps one trace
+  // per route and returns each route's bits.
+  if (small_m_route_gate_off()) {
+    MESSAGE("NAX GPU: small-row route gate off, test skipped");
+    return;
+  }
+  random::seed(0);
+  for (auto c : small_m_route_cases()) {
+    CAPTURE(c.K);
+    CAPTURE(c.N);
+    CAPTURE(c.bits);
+    CAPTURE(c.dtype);
+    auto x = astype(
+        random::normal({16, c.K}) / std::sqrt(static_cast<float>(c.K)),
+        c.dtype);
+    auto q =
+        quantize(astype(random::normal({c.N, c.K}), c.dtype), c.gs, c.bits);
+    eval(x, q[0], q[1], q[2]);
+    int traces = 0;
+    std::function<std::vector<array>(const std::vector<array>&)> fun =
+        [&](const std::vector<array>& in) {
+          ++traces;
+          return std::vector<array>{quantized_matmul(
+              in[0], in[1], in[2], in[3], true, c.gs, c.bits)};
+        };
+    auto cfun = compile(fun);
+    for (int M : {2, 3, 8}) {
+      CAPTURE(M);
+      auto rows = slice(x, {0, 0}, {M, c.K});
+      std::vector<array> in = {rows, q[0], q[1], q[2]};
+      for (int route :
+           {small_m_route_row_invariant,
+            small_m_route_stock_order,
+            small_m_route_row_invariant}) {
+        CAPTURE(route);
+        ScopedSmallMRoute scope(route);
+        auto ref = fun(in)[0];
+        auto out = cfun(in)[0];
+        eval(ref, out);
+        CHECK(array_equal(out, ref).item<bool>());
+      }
+    }
+    CHECK_EQ(traces, 3 * 3 + 3 * 2); // 3 direct calls and 2 traces per M.
   }
 }

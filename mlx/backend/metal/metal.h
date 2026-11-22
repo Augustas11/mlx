@@ -27,4 +27,9 @@ MLX_API const
 MLX_API void set_metallib_path(const std::string& path);
 MLX_API const std::string& get_metallib_path();
 
+/* macprovider: internal. The number of K partial sums (WK) the small-row
+ * qmv_mma kernels use on the given small-row route (see small_m_route.h), on
+ * this process's GPU. quantized_matmul captures it per op. */
+int qmv_mma_partial_sums(int route);
+
 } // namespace mlx::core::metal

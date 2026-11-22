@@ -6,6 +6,7 @@
 #include "doctest/doctest.h"
 
 #include <cmath>
+#include <future>
 #include <limits>
 
 #include "mlx/mlx.h"
@@ -874,4 +875,95 @@ TEST_CASE("test compile throwing first trace does not poison cache") {
   auto out = cfun({});
   REQUIRE_EQ(out.size(), 1);
   CHECK_EQ(out[0].item<float>(), 3.0f);
+}
+
+TEST_CASE("test small-M route scope") {
+  // macprovider: the thread-scoped small-row route (mlx/small_m_route.h).
+  // Nothing here is evaluated: the checks read the captured primitives and
+  // count traces, so they run on any device.
+  const int process = process_small_m_route();
+  CHECK_EQ(small_m_route_scope(), -1);
+  CHECK_EQ(small_m_route(), process);
+  {
+    ScopedSmallMRoute outer(small_m_route_stock_order);
+    CHECK_EQ(small_m_route(), small_m_route_stock_order);
+    {
+      ScopedSmallMRoute inner(small_m_route_row_invariant);
+      CHECK_EQ(small_m_route(), small_m_route_row_invariant);
+    }
+    CHECK_EQ(small_m_route(), small_m_route_stock_order);
+  }
+  CHECK_EQ(small_m_route_scope(), -1);
+  CHECK_EQ(small_m_route(), process);
+
+  // A scope selects 1 or 2 only; serial_only stays process-wide.
+  CHECK_THROWS_AS(
+      ScopedSmallMRoute{small_m_route_serial_only}, std::invalid_argument);
+  CHECK_THROWS_AS(set_small_m_route_scope(3), std::invalid_argument);
+  CHECK_EQ(small_m_route_scope(), -1);
+  set_small_m_route_scope(small_m_route_stock_order);
+  CHECK_EQ(small_m_route(), small_m_route_stock_order);
+  clear_small_m_route_scope();
+  CHECK_EQ(small_m_route(), process);
+
+  // The scope is per thread.
+  {
+    ScopedSmallMRoute scope(small_m_route_stock_order);
+    int other = std::async(std::launch::async, [] {
+                  return small_m_route();
+                }).get();
+    CHECK_EQ(other, process);
+  }
+
+  // Each op captures the route it was built under; two ops that differ only
+  // in route are not equivalent (simplify must not merge them).
+  auto x = zeros({3, 512}, float32, Device::cpu);
+  auto q = quantize(zeros({512, 512}, float32, Device::cpu), 64, 4, "affine",
+      std::nullopt, Device::cpu);
+  auto qmm = [&]() {
+    return quantized_matmul(
+        x, q[0], q[1], q[2], true, 64, 4, "affine", Device::cpu);
+  };
+  array a1 = qmm();
+  array a1b = qmm();
+  array a2 = qmm();
+  {
+    ScopedSmallMRoute scope(small_m_route_row_invariant);
+    a1 = qmm();
+    a1b = qmm();
+  }
+  {
+    ScopedSmallMRoute scope(small_m_route_stock_order);
+    a2 = qmm();
+  }
+  CHECK(a1.primitive().is_equivalent(a1b.primitive()));
+  CHECK_FALSE(a1.primitive().is_equivalent(a2.primitive()));
+
+  // compile keeps one trace per route.
+  int traces = 0;
+  std::function<std::vector<array>(const std::vector<array>&)> fun =
+      [&traces, &q](const std::vector<array>& in) {
+        ++traces;
+        return std::vector<array>{quantized_matmul(
+            in[0], q[0], q[1], q[2], true, 64, 4, "affine", Device::cpu)};
+      };
+  auto cfun = compile(fun);
+  {
+    ScopedSmallMRoute scope(small_m_route_row_invariant);
+    cfun({x});
+  }
+  {
+    ScopedSmallMRoute scope(small_m_route_stock_order);
+    cfun({x});
+  }
+  CHECK_EQ(traces, 2);
+  {
+    ScopedSmallMRoute scope(small_m_route_row_invariant);
+    cfun({x});
+  }
+  {
+    ScopedSmallMRoute scope(small_m_route_stock_order);
+    cfun({x});
+  }
+  CHECK_EQ(traces, 2);
 }

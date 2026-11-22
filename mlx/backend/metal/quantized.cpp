@@ -7,11 +7,13 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/matmul.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/unary.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
+#include "mlx/small_m_route.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
@@ -665,17 +667,13 @@ void qmv_wide(
 //     qmv_fast_rows are 4-7% faster than qmv_mma (12.27 vs 12.85, 36.51 vs
 //     39.05); from three rows qmv_mma is faster. The 2-row plain-qmv
 //     shapes (K not a multiple of the qmv_fast K step) were not measured.
-// Read once, at the first product that reaches this test: a route that could
-// change inside a process would let state computed on one route continue on
-// the other. A per-call route is planned; until then the value holds for the
-// whole process.
-inline int small_m_route() {
-  static const int route = [] {
-    int v = env::get_var("MLX_METAL_SMALL_M_ROW_INVARIANT", 1);
-    return (v == 0 || v == 2) ? v : 1;
-  }();
-  return route;
-}
+// The process value is read once (process_small_m_route in small_m_route.cpp):
+// a route that could change inside a process would let state computed on one
+// route continue on the other. A thread may scope ops it builds to route 1 or
+// 2 (ScopedSmallMRoute); each QuantizedMatmul captures the route in effect
+// when it is added to the graph (small_m_route_), and this file reads only
+// that member, so an op keeps its route whatever scope is active when it is
+// evaluated.
 
 // macprovider: selects the affine weights whose small-M rows take the qmv_mma
 // reduction (ml-explore/mlx#4787) on non-NAX GPUs, ahead of the qmm route (see
@@ -684,8 +682,9 @@ inline int small_m_route() {
 // and inside a batch. Upstream starts qmv_mma at 3 or 4 rows and keeps Ultra
 // on qmv; both checks depend on M or the chip size, so they are dropped and
 // the window starts at 1 row, where qmv_mma1 computes the same bits.
-// The stock-order route (small_m_route() == 2) uses the same weight test.
+// The stock-order route (route 2) uses the same weight test.
 inline bool use_affine_qmv_mma(
+    int route,
     const array& w,
     const array& scales,
     QuantizationMode mode,
@@ -702,8 +701,8 @@ inline bool use_affine_qmv_mma(
   // MLX_METAL_SMALL_M_ROW_INVARIANT=0 to take the per-row qmv / qmm route
   // below, which is what upstream runs and is faster at one row. The default
   // keeps the window, so leaving the variable unset can cost speed, never a
-  // row's bits. The value is read once per process (small_m_route).
-  if (small_m_route() == 0) {
+  // row's bits. Route 0 is process-wide only (a scope cannot select it).
+  if (route == small_m_route_serial_only) {
     return false;
   }
   if ((bits != 4 && bits != 8) ||
@@ -719,7 +718,7 @@ inline bool use_affine_qmv_mma(
 
 // macprovider: WK, the number of K partial sums of the qmv_mma reduction, for
 // both qmv_mma and qmv_mma1 (see affine_qmv_mma1 in kernels/quantized.h).
-// The default is 8 on the stock-order route (small_m_route() == 2) on
+// The default is 8 on the stock-order route (route 2) on
 // generation 13 and 15 GPUs, and 4 everywhere else: the row-invariant route
 // keeps 4 on every GPU, so its bits are the ones native MTP and the other
 // row-invariant processes were qualified on. MLX_METAL_QMV_MMA_WK = 4, 8 or
@@ -735,17 +734,20 @@ inline bool use_affine_qmv_mma(
 // route (14, 16, and non-NAX 17) were not measured and keep 4. A row alone and the
 // same row in a batch gave the same bits at 4, 8 and 16 on that GPU (the
 // small-M tests). WK changes the reduction order and so the bits of every
-// output, so it is fixed once per process, at the first product that takes
-// the qmv_mma route, and both kernels use that value for every call after.
-inline int qmv_mma_wk(metal::Device& d) {
-  static const int wk = [&d] {
-    const int gen = d.get_architecture_gen();
-    const int fallback =
-        (small_m_route() == 2 && (gen == 13 || gen == 15)) ? 8 : 4;
-    int v = env::get_var("MLX_METAL_QMV_MMA_WK", fallback);
-    return (v == 4 || v == 8 || v == 16) ? v : fallback;
-  }();
-  return wk;
+// output, so it is a function of the route alone within a process (the GPU
+// generation and the variable are read once). quantized_matmul captures it on
+// the QuantizedMatmul next to the route when the op is built
+// (qmv_mma_wk_), and both kernels take that value. The kernel names carry
+// WK (qmv_mma always, qmv_mma1 when WK != 4), so the pipelines of both
+// routes coexist in one process.
+int metal::qmv_mma_partial_sums(int route) {
+  static const int gen =
+      metal::device(mlx::core::Device::gpu).get_architecture_gen();
+  static const int env_wk = env::get_var("MLX_METAL_QMV_MMA_WK", 0);
+  const int fallback =
+      (route == small_m_route_stock_order && (gen == 13 || gen == 15)) ? 8
+                                                                         : 4;
+  return (env_wk == 4 || env_wk == 8 || env_wk == 16) ? env_wk : fallback;
 }
 
 void qmv_mma(
@@ -761,11 +763,11 @@ void qmv_mma(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    int wk) {
   // wk sets a row's K reduction order and must match qmv_mma1; the row
   // tiling never changes it, tm and bn only pick how many rows and columns
   // one threadgroup covers. The threadgroup is 32 wk threads (at most 512).
-  const int wk = qmv_mma_wk(d);
   int tm = (M > 8) ? 2 : 1;
   int bn = 16;
   // Below gen 15, affine with one row tile is faster at 32 columns (M2 Pro).
@@ -837,8 +839,8 @@ void qmv_mma1(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
-  const int wk = qmv_mma_wk(d);
+    const std::string& mode,
+    int wk) {
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
@@ -868,14 +870,15 @@ void qmv_mma1(
 }
 
 // macprovider: the 2-row stock-order kernel (MLX_METAL_SMALL_M_ROW_INVARIANT=2,
-// see small_m_route). affine_qmv_fast_rows (kernels/quantized.h) computes
-// rows in one dispatch with, for every output element, exactly the float
+// see the route comment above use_affine_qmv_mma). affine_qmv_fast_rows
+// (kernels/quantized.h) computes rows in one dispatch with, for every
+// output element, exactly the float
 // operations of upstream's affine_qmv_fast for that row alone, so a row
 // equals that row computed alone by qmv_fast bit for bit. A standalone harness
 // found 0 differing elements against per-row qmv_fast on an Apple M5 and an
 // Apple M3 Ultra, and the small-M tests passed on the M3 Ultra with it
 // serving 2..16 rows. The route sends it 2 rows only: in the model passes
-// measured in small_m_route it beat qmv_mma at 2 rows and lost from 3.
+// measured in that comment it beat qmv_mma at 2 rows and lost from 3.
 // MR = 4 rows per threadgroup; 4 bits keep the raw weight words in registers
 // (packed), 8 bits keep unpacked floats, the faster variant of each in the M3
 // Ultra timing. Grid (ceil(M / 4), N / 8, 1), threadgroup (32, 2, 1), as in
@@ -2245,10 +2248,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // macprovider: rows below the qmm route take the qmv_mma reduction when the
   // weight shape qualifies, from 1 row up: WK partial sums over 128-wide K
-  // blocks, added in one fixed order (WK = 4 unless MLX_METAL_QMV_MMA_WK
-  // picks 8 or 16 for the process, see qmv_mma_wk). That is the one reduction
-  // order of the whole window, and two kernels implement it: qmv_mma1 for 1
-  // row and qmv_mma (ml-explore/mlx#4787) for 2 rows and more. Both give the
+  // blocks, added in one fixed order (WK per route, see qmv_mma_partial_sums;
+  // the op carries its value in qmv_mma_wk_). That is the one reduction order
+  // of the op's route, and two kernels implement it: qmv_mma1 for 1 row and
+  // qmv_mma (ml-explore/mlx#4787) for 2 rows and more. Both give the
   // same bits for a row, so a row's result does not depend on how many rows
   // share the call, and the switch point is a speed choice (qmv_mma1_max_rows). The
   // weight test reads no row count, and the row limit is at least 17 so 1..16
@@ -2261,13 +2264,20 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // (python/tests/test_quantized.py) and by "test gpu small-M quantized matmul
   // batch invariance" (tests/gpu_tests.cpp).
   if (transpose_ && !reference_prefill && w.ndim() == 2 && biases &&
-      use_affine_qmv_mma(w, scales, mode_, group_size_, bits_, N, K)) {
+      use_affine_qmv_mma(
+          small_m_route_, w, scales, mode_, group_size_, bits_, N, K)) {
     int rows = x.size() / K;
-    const bool stock_order = (small_m_route() == 2);
+    const bool stock_order = (small_m_route_ == small_m_route_stock_order);
+    // quantized_matmul sets qmv_mma_wk_ for every affine GPU op; an op built
+    // for another device and moved here takes its route's value.
+    const int wk = (qmv_mma_wk_ == 4 || qmv_mma_wk_ == 8 || qmv_mma_wk_ == 16)
+        ? qmv_mma_wk_
+        : metal::qmv_mma_partial_sums(small_m_route_);
     if (stock_order && rows == 2) {
-      // macprovider: stock order, 2 rows (see small_m_route for the
-      // measurement). Each row must equal that row computed alone on the
-      // upstream one-row route, bit for bit. Under the weight test above
+      // macprovider: stock order, 2 rows (see the route comment above
+      // use_affine_qmv_mma for the measurement). Each row must equal that
+      // row computed alone on the upstream one-row route, bit for bit.
+      // Under the weight test above
       // (affine, no NAX, bits 4 or 8, K % 128 == 0, K >= 512, N % 16 == 0,
       // biases, 2-D w) one row (M = 1, below every vector_limit) never
       // reaches qmm, qmv_quad (K is 64 or 128 only), qmv_wide (K % 128 != 0
@@ -2350,7 +2360,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
             K,
             d,
             s,
-            mode);
+            mode,
+            wk);
       } else {
         qmv_mma(
             x,
@@ -2365,7 +2376,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
             K,
             d,
             s,
-            mode);
+            mode,
+            wk);
       }
       return;
     }
