@@ -7,7 +7,6 @@
 #include <cassert>
 #include <cmath>
 #include <numeric>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -16,7 +15,6 @@
 #include "mlx/linalg.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
-#include "mlx/small_m_route.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
@@ -3607,23 +3605,26 @@ std::vector<array> QuantizedMatmul::vjp(
   for (auto arg : argnums) {
     // gradient wrt to x
     if (arg == 0) {
-      // The derived product keeps this op's small-row route.
-      std::optional<ScopedSmallMRoute> route;
-      if (small_m_route_ != small_m_route_serial_only) {
-        route.emplace(small_m_route_);
-      }
-      vjps.push_back(quantized_matmul(
-          cotangents[0],
-          primals[1],
-          primals[2],
-          mode_ == QuantizationMode::Affine ? std::optional<array>(primals[3])
-                                            : std::nullopt,
-          !transpose_,
+      // macprovider: built directly, not through quantized_matmul, so the
+      // derived product keeps this op's small-row route and WK (route 0
+      // included) whatever scope the calling thread has.
+      auto p = std::make_shared<QuantizedMatmul>(
+          stream(),
           group_size_,
           bits_,
-          quantization_mode_to_string(mode_),
-          stream(),
-          reference_prefill_));
+          mode_,
+          !transpose_,
+          reference_prefill_,
+          small_m_route_,
+          qmv_mma_wk_);
+      std::vector<array> inputs(primals.begin(), primals.end());
+      inputs[0] = astype(cotangents[0], primals[0].dtype(), stream());
+      auto shape = p->output_shapes(inputs)[0];
+      vjps.push_back(array(
+          std::move(shape),
+          primals[0].dtype(),
+          std::move(p),
+          std::move(inputs)));
     }
 
     // gradient wrt to w_q, scales or biases
@@ -3677,23 +3678,22 @@ std::vector<array> QuantizedMatmul::jvp(
     throw std::runtime_error(
         "[QuantizedMatmul::jvp] No JVP wrt the quantized matrix yet.");
   }
-  // The derived product keeps this op's small-row route.
-  std::optional<ScopedSmallMRoute> route;
-  if (small_m_route_ != small_m_route_serial_only) {
-    route.emplace(small_m_route_);
-  }
-  return {quantized_matmul(
-      tangents[0],
-      primals[1],
-      primals[2],
-      mode_ == QuantizationMode::Affine ? std::optional<array>(primals[3])
-                                        : std::nullopt,
-      transpose_,
+  // macprovider: built directly, as in vjp, so the derived product keeps
+  // this op's small-row route and WK whatever scope the calling thread has.
+  auto p = std::make_shared<QuantizedMatmul>(
+      stream(),
       group_size_,
       bits_,
-      quantization_mode_to_string(mode_),
-      stream(),
-      reference_prefill_)};
+      mode_,
+      transpose_,
+      reference_prefill_,
+      small_m_route_,
+      qmv_mma_wk_);
+  std::vector<array> inputs(primals.begin(), primals.end());
+  inputs[0] = astype(tangents[0], primals[0].dtype(), stream());
+  auto shape = p->output_shapes(inputs)[0];
+  return {array(
+      std::move(shape), primals[0].dtype(), std::move(p), std::move(inputs))};
 }
 
 bool QuantizedMatmul::is_equivalent(const Primitive& other) const {

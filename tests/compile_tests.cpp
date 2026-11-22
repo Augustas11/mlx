@@ -967,3 +967,43 @@ TEST_CASE("test small-M route scope") {
   }
   CHECK_EQ(traces, 2);
 }
+
+TEST_CASE("test small-M route survives vjp and jvp") {
+  // macprovider: the derived products of a QuantizedMatmul keep its route and
+  // WK, route 0 included, whatever scope the thread has when they are built.
+  // Nothing is evaluated.
+  auto s = default_stream(Device::cpu);
+  auto x = zeros({3, 512}, float32, Device::cpu);
+  auto q = quantize(zeros({512, 512}, float32, Device::cpu), 64, 4, "affine",
+      std::nullopt, Device::cpu);
+  std::vector<array> in = {x, q[0], q[1], q[2]};
+  auto op = [&](bool transpose, int route, int wk) {
+    return QuantizedMatmul(
+        s, 64, 4, QuantizationMode::Affine, transpose, false, route, wk);
+  };
+  for (int route :
+       {small_m_route_serial_only,
+        small_m_route_row_invariant,
+        small_m_route_stock_order}) {
+    for (int wk : {4, 8}) {
+      CAPTURE(route);
+      CAPTURE(wk);
+      auto prim = std::make_shared<QuantizedMatmul>(
+          s, 64, 4, QuantizationMode::Affine, true, false, route, wk);
+      auto shape = prim->output_shapes(in)[0];
+      array y(shape, float32, prim, in);
+      int other = (route == small_m_route_stock_order)
+          ? small_m_route_row_invariant
+          : small_m_route_stock_order;
+      ScopedSmallMRoute scope(other);
+      auto cot = ones(y.shape(), float32, Device::cpu);
+      auto g = y.primitive().vjp(in, {cot}, {0}, {y})[0];
+      CHECK(g.primitive().is_equivalent(op(false, route, wk)));
+      CHECK_FALSE(g.primitive().is_equivalent(op(false, other, wk)));
+      CHECK_FALSE(g.primitive().is_equivalent(op(false, route, 12 - wk)));
+      auto t = y.primitive().jvp(in, {x}, {0})[0];
+      CHECK(t.primitive().is_equivalent(op(true, route, wk)));
+      CHECK_FALSE(t.primitive().is_equivalent(op(true, other, wk)));
+    }
+  }
+}
