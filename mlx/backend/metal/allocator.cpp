@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <cassert>
 #include <cstdlib>
+#include <limits>
 
 namespace mlx::core {
 
@@ -94,6 +95,7 @@ size_t MetalAllocator::set_memory_limit(size_t limit) {
 };
 
 size_t MetalAllocator::get_memory_limit() {
+  std::unique_lock lk(mutex_);
   return block_limit_;
 }
 
@@ -129,7 +131,12 @@ Buffer MetalAllocator::malloc(size_t size) {
   std::unique_lock lk(mutex_);
   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
   if (!buf) {
-    size_t mem_required = get_active_memory() + get_cache_memory() + size;
+    auto cache_size = buffer_cache_.cache_size();
+    assert(active_memory_ <= std::numeric_limits<size_t>::max() - cache_size);
+    assert(
+        size <=
+        std::numeric_limits<size_t>::max() - active_memory_ - cache_size);
+    size_t mem_required = active_memory_ + cache_size + size;
 
     // If we have a lot of memory pressure try to reclaim memory from the cache
     if (mem_required >= gc_limit_ || num_resources_ >= resource_limit_) {
@@ -163,16 +170,21 @@ Buffer MetalAllocator::malloc(size_t size) {
     }
   }
 
+  assert(buf->length() <= std::numeric_limits<size_t>::max() - active_memory_);
   active_memory_ += buf->length();
   peak_memory_ = std::max(peak_memory_, active_memory_);
 
   // Maintain the cache below the requested limit
-  if (get_cache_memory() > max_pool_size_) {
+  if (buffer_cache_.cache_size() > max_pool_size_) {
     num_resources_ -= buffer_cache_.release_cached_buffers(
-        get_cache_memory() - max_pool_size_);
+        buffer_cache_.cache_size() - max_pool_size_);
   }
 
-  return Buffer{static_cast<void*>(buf)};
+  Buffer buffer(static_cast<void*>(buf));
+#ifndef NDEBUG
+  track_allocation(buffer.raw_ptr(), size);
+#endif
+  return buffer;
 }
 
 void MetalAllocator::clear_cache() {
@@ -185,9 +197,15 @@ void MetalAllocator::free(Buffer buffer) {
   if (buf == nullptr) {
     return;
   }
+
+#ifndef NDEBUG
+  untrack_allocation(buffer.raw_ptr());
+#endif
+
   std::unique_lock lk(mutex_);
+  assert(buf->length() <= active_memory_);
   active_memory_ -= buf->length();
-  if (get_cache_memory() < max_pool_size_) {
+  if (buffer_cache_.cache_size() < max_pool_size_) {
     buffer_cache_.recycle_to_cache(buf);
   } else {
     num_resources_--;
@@ -215,6 +233,7 @@ Buffer MetalAllocator::make_buffer(void* ptr, size_t size) {
   // The caller owns this memory, so it is not wired. Wiring a file-backed
   // mapping would read the whole file and keep it in memory.
   std::unique_lock lk(mutex_);
+  assert(buf->length() <= std::numeric_limits<size_t>::max() - active_memory_);
   active_memory_ += buf->length();
   peak_memory_ = std::max(peak_memory_, active_memory_);
   num_resources_++;
@@ -227,6 +246,7 @@ void MetalAllocator::release(Buffer buffer) {
     return;
   }
   std::unique_lock lk(mutex_);
+  assert(buf->length() <= active_memory_);
   active_memory_ -= buf->length();
   num_resources_--;
   lk.unlock();
@@ -244,6 +264,14 @@ MetalAllocator& allocator() {
 }
 
 } // namespace metal
+
+namespace allocator {
+
+bool over_memory_limit() {
+  return metal::allocator().over_memory_limit();
+}
+
+} // namespace allocator
 
 size_t set_cache_limit(size_t limit) {
   return metal::allocator().set_cache_limit(limit);

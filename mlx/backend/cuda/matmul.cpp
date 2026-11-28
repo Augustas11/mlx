@@ -35,7 +35,7 @@ check_transpose(cu::CommandEncoder& enc, const Stream& s, const array& arr) {
 std::tuple<bool, int64_t, array>
 ensure_batch_contiguous(const array& x, cu::CommandEncoder& encoder, Stream s) {
   if (x.flags().row_contiguous) {
-    return std::make_tuple(false, x.strides(-2), x);
+    return std::make_tuple(false, x.shape(-1), x);
   }
 
   bool rc = true;
@@ -81,7 +81,7 @@ void gemm_and_bias(
   // Check and collapse batch dimensions
   auto [batch_shape, a_batch_strides, b_batch_strides] = collapse_batches(a, b);
 
-  auto batch_count = out.size() / (M * N);
+  auto batch_count = out.size() / (int64_t(M) * N);
 
   // Collapse batches into M if needed
   if (batch_count > 1 && !a_transposed && batch_shape.size() == 1 &&
@@ -257,6 +257,11 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& b_pre = inputs[1];
   auto c = inputs[2];
 
+  if (out.size() == 0) {
+    out.set_data(cu::malloc_async(0, encoder));
+    return;
+  }
+
   /////////////////////////////////////////////////////////////////////////////
   // Init checks and prep
 
@@ -316,7 +321,7 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [batch_shape, a_batch_strides, b_batch_strides, c_batch_strides] =
       collapse_batches(a, b, c);
 
-  auto batch_count = out.size() / (M * N);
+  auto batch_count = out.size() / (int64_t(M) * N);
 
   // Collapse batches into M if needed
   if (batch_count > 1 && !a_transposed && batch_shape.size() == 1 &&

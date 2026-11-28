@@ -6,6 +6,18 @@
 
 namespace mlx::core::simd {
 
+template <typename To, typename From>
+inline To bit_cast(const From& from) {
+  static_assert(sizeof(To) == sizeof(From));
+#if defined(_MSC_VER) && !defined(__clang__)
+  return __builtin_bit_cast(To, from);
+#else
+  To to;
+  __builtin_memcpy(&to, &from, sizeof(To));
+  return to;
+#endif
+}
+
 constexpr float inf = std::numeric_limits<float>::infinity();
 
 /**
@@ -28,6 +40,13 @@ template <typename T, int N>
 Simd<T, N> exp(Simd<T, N> in) {
   if constexpr (is_complex<T>) {
     return Simd<T, 1>{std::exp(in.value)};
+  } else if constexpr (std::is_same_v<T, double>) {
+    // The path below computes in float32.
+    Simd<T, N> out;
+    for (int i = 0; i < N; ++i) {
+      out[i] = std::exp(in[i]);
+    }
+    return out;
   } else {
     Simd<float, N> x_init = in;
     auto x = x_init * 1.442695f; // multiply with log_2(e)
@@ -44,11 +63,17 @@ Simd<T, N> exp(Simd<T, N> in) {
     x = fma(x, fpart, 1.000000000000000f);
 
     // generate 2**ipart in the floating point representation using integer
-    // bitshifting
-    Simd<int, N> epart = (Simd<int, N>(ipart) + 127) << 23;
+    // bitshifting. Adding 1.5 * 2**23 puts the integer value of ipart in the
+    // low bits of the mantissa, which avoids a float to int conversion that is
+    // undefined for inf, nan and large values. The result is only used for
+    // |x| <= 88, the selects below handle the rest. Unsigned math wraps.
+    auto ibits = bit_cast<Simd<uint32_t, N>>(ipart + 12582912.0f);
+    constexpr uint32_t bias = 127u - 0x4B400000u;
+    Simd<uint32_t, N> epart = (ibits + bias) << 23;
 
     // Deal with NaN and Inf
-    auto result = select(isnan(x_init), x_init, (*(Simd<float, N>*)&epart) * x);
+    auto result =
+        select(isnan(x_init), x_init, bit_cast<Simd<float, N>>(epart) * x);
     result = select(x_init > 88.0f, Simd<float, N>(inf), result);
     result = select(x_init < -88.0f, Simd<float, N>(0), result);
     return Simd<T, N>(result);
@@ -121,6 +146,14 @@ Simd<T, N> sincos(Simd<T, N> in) {
 // to libm instead. 2^23 keeps x * 4/pi under 2^24 with room to spare.
 template <bool Sine, typename T, int N>
 Simd<T, N> sincos_checked(Simd<T, N> x) {
+  if constexpr (std::is_same_v<T, double>) {
+    // The path below computes in float32.
+    Simd<T, N> out;
+    for (int i = 0; i < N; ++i) {
+      out[i] = Sine ? std::sin(x[i]) : std::cos(x[i]);
+    }
+    return out;
+  }
   Simd<float, N> xf = x;
   if (any(abs(xf) > Simd<float, N>(8388608.0f))) {
     Simd<T, N> out;
@@ -153,6 +186,14 @@ Simd<T, N> cos(Simd<T, N> x) {
 
 template <typename T, int N>
 Simd<T, N> erf(Simd<T, N> x) {
+  if constexpr (std::is_same_v<T, double>) {
+    // The path below computes in float32.
+    Simd<T, N> out;
+    for (int i = 0; i < N; ++i) {
+      out[i] = std::erf(x[i]);
+    }
+    return out;
+  }
   // https://github.com/pytorch/pytorch/blob/abf28982a8cb43342e7669d859de9543fd804cc9/aten/src/ATen/cpu/vec/vec256/vec256_float.h#L175
   Simd<float, N> v = x;
   auto t = recip(fma(Simd<float, N>(0.3275911f), abs(v), 1.0f));

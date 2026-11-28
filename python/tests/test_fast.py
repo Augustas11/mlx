@@ -491,6 +491,49 @@ class TestFast(mlx_tests.MLXTestCase):
 
     def test_rms_norm_grad(self):
         eps = 1e-5
+        tolerances = {mx.float32: 1e-5, mx.float16: 1e-2, mx.bfloat16: 8e-2}
+        cases = [
+            ((8, 100, 32), 1),
+            ((8, 100, 256), 1),
+            ((8192, 1024), 1),
+            ((16384, 512), 1),
+            ((3, 1025), 1),
+            ((3, 1024), 2),
+            ((2, 2, 8192), 1),
+        ]
+
+        def check_vjp(fast, ref, primals, cotangent, tol):
+            out, grads = mx.vjp(fast, primals, [cotangent])
+            ref_out, ref_grads = mx.vjp(ref, primals, [cotangent])
+            for name, a, b in zip(("y", "dx", "dw"), out + grads, ref_out + ref_grads):
+                atol = tol * mx.abs(b).mean().item() if name == "dw" else tol
+                with self.subTest(output=name):
+                    self.assertEqualArray(a, b, atol=atol, rtol=tol)
+
+        for dtype, tol in tolerances.items():
+            for shape, w_stride in cases:
+                with self.subTest(dtype=dtype, shape=shape, w_stride=w_stride):
+                    D = shape[-1]
+                    x = mx.random.uniform(shape=shape).astype(dtype)
+                    w = mx.random.uniform(shape=(D * w_stride,)).astype(dtype)
+                    w = w[::w_stride]
+                    g = mx.random.uniform(shape=shape).astype(dtype)
+                    ones = mx.ones((D,), dtype)
+                    mx.eval(x, w, g, ones)
+                    check_vjp(
+                        lambda x, w: mx.fast.rms_norm(x, w, eps),
+                        lambda x, w: rms_norm(x, w, eps),
+                        [x, w],
+                        g,
+                        tol,
+                    )
+                    check_vjp(
+                        lambda x: mx.fast.rms_norm(x, None, eps),
+                        lambda x: rms_norm(x, ones, eps),
+                        [x],
+                        g,
+                        tol,
+                    )
 
         def f1(x, w, y):
             return (rms_norm(x, w, eps) * y).sum()
@@ -498,35 +541,10 @@ class TestFast(mlx_tests.MLXTestCase):
         def f2(x, w, y):
             return (mx.fast.rms_norm(x, w, eps) * y).sum()
 
-        def f3(x, y):
-            return (rms_norm(x, mx.ones((x.shape[-1],)), eps) * y).sum()
-
-        def f4(x, y):
-            return (mx.fast.rms_norm(x, None, eps) * y).sum()
-
-        for D in [32, 256]:
-            x = mx.random.uniform(shape=(8, 100, D))
-            w = mx.random.uniform(shape=(D,))
-            y = mx.random.uniform(shape=(8, 100, D))
-            gx1, gw1 = mx.grad(f1, argnums=(0, 1))(x, w, y)
-            gx2, gw2 = mx.grad(f2, argnums=(0, 1))(x, w, y)
-            self.assertLess(mx.abs(gx1 - gx2).max(), 1e-5)
-            self.assertLess(mx.abs(gw1 - gw2).max() / mx.abs(gw1).mean(), 1e-5)
-            gx1 = mx.grad(f3, argnums=(0,))(x, y)
-            gx2 = mx.grad(f4, argnums=(0,))(x, y)
-            self.assertLess(mx.abs(gx1 - gx2).max(), 1e-5)
-
         D = 8192
         x = mx.random.uniform(shape=(2, 2, D))
         w = mx.random.uniform(shape=(D,))
         y = mx.random.uniform(shape=(2, 2, D))
-        gx1, gw1 = mx.grad(f1, argnums=(0, 1))(x, w, y)
-        gx2, gw2 = mx.grad(f2, argnums=(0, 1))(x, w, y)
-        self.assertLess(mx.abs(gx1 - gx2).max(), 1e-5)
-        self.assertLess(mx.abs(gw1 - gw2).max() / mx.abs(gw1).mean(), 1e-5)
-        gx1 = mx.grad(f3, argnums=(0,))(x, y)
-        gx2 = mx.grad(f4, argnums=(0,))(x, y)
-        self.assertLess(mx.abs(gx1 - gx2).max(), 1e-5)
 
         def gf(f):
             def inner(x, w, y):
@@ -611,6 +629,22 @@ class TestFast(mlx_tests.MLXTestCase):
         g2 = mx.grad(f4, argnums=0)(logits, targets)
         self.assertEqual(g2.shape, logits.shape)
         self.assertLess(mx.abs(g1 - g2).max().item(), 1e-6)
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "No GPU available")
+    def test_cross_entropy_grad_non_contiguous(self):
+        B, L, V = 32, 129, 8192
+        logits = mx.random.normal(shape=(B, L, V)).astype(mx.bfloat16)
+        targets = mx.random.randint(0, V, shape=(B, L))
+
+        def f_sliced(x):
+            return mx.fast.cross_entropy(x[:, :-1], targets[:, 1:]).sum()
+
+        def f_contiguous(x):
+            return mx.fast.cross_entropy(mx.contiguous(x[:, :-1]), targets[:, 1:]).sum()
+
+        expected = mx.grad(f_contiguous)(logits)
+        g = mx.grad(f_sliced)(logits)
+        self.assertTrue(mx.array_equal(g, expected))
 
     def test_layer_norm_dim_check(self):
         with self.assertRaises(ValueError):
@@ -717,8 +751,38 @@ class TestFast(mlx_tests.MLXTestCase):
         self.assertLess(mx.abs(rx - rx_fast).max(), 1e-4)
 
     def test_layer_norm_grad(self):
-        D = 32
         eps = 1e-5
+        tolerances = {mx.float32: 5e-5, mx.float16: 1e-2, mx.bfloat16: 8e-2}
+        shapes = [(8, 100, 32), (3, 128), (3, 1024), (3, 4096), (8, 100, 8192)]
+        for dtype, tol in tolerances.items():
+            for shape in shapes:
+                with self.subTest(dtype=dtype, shape=shape):
+                    D = shape[-1]
+                    x = mx.random.uniform(shape=shape).astype(dtype)
+                    w = mx.random.uniform(shape=(D,)).astype(dtype)
+                    b = mx.random.uniform(shape=(D,)).astype(dtype)
+                    g = mx.random.uniform(shape=shape).astype(dtype)
+                    mx.eval(x, w, b, g)
+                    out, grads = mx.vjp(
+                        lambda x, w, b: mx.fast.layer_norm(x, w, b, eps),
+                        [x, w, b],
+                        [g],
+                    )
+                    ref_out, ref_grads = mx.vjp(
+                        lambda x, w, b: layer_norm(x, w, b, eps),
+                        [x, w, b],
+                        [g],
+                    )
+                    for name, a, r in zip(
+                        ("y", "dx", "dw", "db"), out + grads, ref_out + ref_grads
+                    ):
+                        atol = (
+                            tol * mx.abs(r).mean().item()
+                            if name in ("dw", "db")
+                            else tol
+                        )
+                        with self.subTest(output=name):
+                            self.assertEqualArray(a, r, atol=atol, rtol=tol)
 
         def f1(x, w, b, y):
             return (layer_norm(x, w, b, eps) * y).sum()
@@ -726,28 +790,11 @@ class TestFast(mlx_tests.MLXTestCase):
         def f2(x, w, b, y):
             return (mx.fast.layer_norm(x, w, b, eps) * y).sum()
 
-        x = mx.random.uniform(shape=(8, 100, D))
-        w = mx.random.uniform(shape=(D,))
-        b = mx.random.uniform(shape=(D,))
-        y = mx.random.uniform(shape=(8, 100, D))
-
-        gx1, gw1, gb1 = mx.grad(f1, argnums=(0, 1, 2))(x, w, b, y)
-        gx2, gw2, gb2 = mx.grad(f2, argnums=(0, 1, 2))(x, w, b, y)
-        self.assertLess(mx.abs(gx1 - gx2).max(), 1e-5)
-        self.assertLess(mx.abs(gw1 - gw2).max() / mx.abs(gw1).mean(), 1e-5)
-        self.assertLess(mx.abs(gb1 - gb2).max() / mx.abs(gb1).mean(), 1e-5)
-
         D = 8192
         x = mx.random.uniform(shape=(8, 100, D))
         w = mx.random.uniform(shape=(D,))
         b = mx.random.uniform(shape=(D,))
         y = mx.random.uniform(shape=(8, 100, D))
-
-        gx1, gw1, gb1 = mx.grad(f1, argnums=(0, 1, 2))(x, w, b, y)
-        gx2, gw2, gb2 = mx.grad(f2, argnums=(0, 1, 2))(x, w, b, y)
-        self.assertLess(mx.abs(gx1 - gx2).max(), 5e-5)
-        self.assertLess(mx.abs(gw1 - gw2).max() / mx.abs(gw1).mean(), 5e-5)
-        self.assertLess(mx.abs(gb1 - gb2).max() / mx.abs(gb1).mean(), 5e-5)
 
         def gf(f):
             def inner(x, w, b, y):
@@ -1302,6 +1349,83 @@ class TestFast(mlx_tests.MLXTestCase):
         )
         mx.eval(out)
         self.assertEqual(out.tolist(), [-1, -1, -1, -1])
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_custom_kernel_template_args_one_object(self):
+        # An int 1 and a bool true template argument give the same kernel name
+        # but a different signature, which sizeof(S) exposes. Calling them in
+        # alternation on one kernel object must run the right source each time.
+        kernel = mx.fast.metal_kernel(
+            name="template_args",
+            input_names=["inp"],
+            output_names=["out"],
+            source="""
+                uint elem = thread_position_in_grid.x;
+                out[elem] = inp[elem] * S + sizeof(S);
+            """,
+        )
+
+        a = mx.arange(32, dtype=mx.float32)
+        cases = [(3, a * 3 + 4), (1, a + 4), (True, a + 1)]
+        for _ in range(2):
+            for s, expected in cases:
+                (out,) = kernel(
+                    inputs=[a],
+                    template=[("S", s)],
+                    grid=(a.size, 1, 1),
+                    threadgroup=(a.size, 1, 1),
+                    output_shapes=[a.shape],
+                    output_dtypes=[a.dtype],
+                    stream=mx.gpu,
+                )
+                self.assertTrue(mx.array_equal(out, expected))
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_custom_function_metal_kernel_vmap_jvp(self):
+        kernel = mx.fast.metal_kernel(
+            name="double_it",
+            input_names=["inp"],
+            output_names=["out"],
+            source="out[thread_position_in_grid.x] = "
+            + "inp[thread_position_in_grid.x] * 2.0f;",
+        )
+
+        def body(a):
+            (o,) = kernel(
+                inputs=[a],
+                grid=(a.size, 1, 1),
+                threadgroup=(a.size, 1, 1),
+                output_shapes=[a.shape],
+                output_dtypes=[a.dtype],
+            )
+            return o
+
+        @mx.custom_function
+        def f(a):
+            return body(a)
+
+        @f.vjp
+        def f_vjp(primals, cotangent, output):
+            return body(cotangent)
+
+        @f.jvp
+        def f_jvp(primals, tangents):
+            return body(tangents)
+
+        @f.vmap
+        def f_vmap(inputs, axes):
+            return body(inputs), axes
+
+        x = mx.ones((8,))
+        grad_out = mx.grad(lambda a: mx.sum(f(a)))(x)
+        self.assertTrue(mx.allclose(grad_out, mx.full((8,), 2.0)))
+
+        _, jvp_out = mx.jvp(f, [x], [x])
+        self.assertTrue(mx.allclose(jvp_out[0], mx.full((8,), 2.0)))
+
+        vmap_out = mx.vmap(f)(mx.ones((4, 8)))
+        self.assertEqual(vmap_out.shape, (4, 8))
+        self.assertTrue(mx.allclose(vmap_out, mx.full((4, 8), 2.0)))
 
 
 if __name__ == "__main__":

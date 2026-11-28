@@ -2,6 +2,10 @@
 
 #include "doctest/doctest.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include "mlx/mlx.h"
 #include "mlx/scheduler.h"
 
@@ -98,6 +102,53 @@ TEST_CASE("test new stream in threads") {
   for (auto& t : threads) {
     t.join();
   }
+}
+
+TEST_CASE("test graph built in another thread evaluates on this thread") {
+  if (!metal::is_available()) {
+    return;
+  }
+  auto s = new_thread_unsafe_stream(default_device());
+  // Reach the scheduler from this thread first. The core treats the first
+  // thread that does so as the main thread, and clear_streams() on that
+  // thread also drops the thread unsafe streams.
+  eval(ones({1}, float32, s));
+  std::vector<array> outs;
+  std::thread t([&] {
+    random::seed(0);
+    auto x = ones({4, 5}, float32, s);
+    auto evaluated = ones({4, 5}, float32, s);
+    eval(evaluated);
+    auto ct = ones({4, 5}, float32, s);
+    outs.push_back(fft::rfft(x, 8, 1, fft::FFTNorm::Backward, s));
+    outs.push_back(random::categorical(x, -1, 2, std::nullopt, s));
+    auto grads = vjp(
+                     [&](const std::vector<array>& in) {
+                       return std::vector<array>{fast::layer_norm(
+                           in[0], std::nullopt, std::nullopt, 1e-5, s)};
+                     },
+                     {x},
+                     {ct})
+                     .second;
+    outs.insert(outs.end(), grads.begin(), grads.end());
+    grads = vjp(
+                [&](const std::vector<array>& in) {
+                  return std::vector<array>{multiply(in[0], in[1], s)};
+                },
+                {evaluated, x},
+                {ct})
+                .second;
+    outs.insert(outs.end(), grads.begin(), grads.end());
+    auto vg = value_and_grad([&](const std::vector<array>& in) {
+      return std::vector<array>{sum(multiply(in[0], in[0], s), false, s)};
+    })({evaluated});
+    outs.insert(outs.end(), vg.first.begin(), vg.first.end());
+    outs.insert(outs.end(), vg.second.begin(), vg.second.end());
+    clear_streams();
+  });
+  t.join();
+
+  CHECK_NOTHROW(eval(outs));
 }
 
 TEST_CASE("test thread unsafe stream") {
@@ -277,6 +328,42 @@ TEST_CASE("test scheduler races") {
     y = exp(y);
   }
   eval(a, y);
+}
+
+TEST_CASE("test eval reads the task count while cpu tasks complete") {
+  auto s = new_stream(Device::cpu);
+  auto y = zeros({100}, s);
+  for (int i = 0; i < 1000; ++i) {
+    y = exp(y, s);
+  }
+  eval(y);
+  CHECK_EQ(y.size(), 100);
+}
+
+TEST_CASE("test wait for capacity blocks until a task completes") {
+  auto s = default_stream(default_device());
+  synchronize(s);
+  for (int i = 0; i < 11; ++i) {
+    scheduler::notify_new_task(s);
+  }
+  std::atomic<bool> returned{false};
+  std::thread waiter([&returned] {
+    scheduler::wait_for_capacity({});
+    returned = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CHECK_FALSE(returned);
+  scheduler::notify_task_completion(s);
+  waiter.join();
+  CHECK(returned);
+  for (int i = 0; i < 10; ++i) {
+    scheduler::notify_task_completion(s);
+  }
+}
+
+TEST_CASE("test wait for capacity returns when under the limit") {
+  synchronize(default_stream(default_device()));
+  scheduler::wait_for_capacity({});
 }
 
 // The fence orders work between two streams. Check that the consumer sees the

@@ -25,6 +25,15 @@ union SharedStorage {
   } epilogue;
 };
 
+template <typename TileM>
+inline constexpr auto make_pipeline_depth(TileM bM) {
+  if constexpr (is_static_v<TileM>) {
+    return Int<(TileM::value == 128 ? 2 : 3)>{};
+  } else {
+    return bM == 128 ? 2 : 3;
+  }
+}
+
 template <typename CtaTiler>
 inline constexpr auto make_smem_layouts(CtaTiler cta_tiler) {
   // Note: Kernel launcher assumes cosize being same for all KMajor.
@@ -34,7 +43,7 @@ inline constexpr auto make_smem_layouts(CtaTiler cta_tiler) {
   auto swizzle_ab = composition(Swizzle<3,3,3>{},
                                 Layout<Shape <_8,Shape <_8, _8>>,
                                        Stride<_8,Stride<_1,_64>>>{});
-  auto bP = Int<3>{}; // pipeline
+  auto bP = make_pipeline_depth(bM);
   auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM, bK, bP));
   auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN, bK, bP));
 
@@ -52,7 +61,7 @@ inline constexpr auto make_tiled_mma() {
       cuda::std::is_same_v<Element, half_t>,
       SM80_16x8x16_F32F16F16F32_TN,
       SM80_16x8x16_F32BF16BF16F32_TN>;
-  if constexpr (TileM >= 32) {
+  if constexpr (TileM >= 32 && TileM != 128) {
     return make_tiled_mma(Atom{}, Layout<Shape<_2,_2,_1>>{}, Tile<_32,_32,_16>{});
   } else {
     return make_tiled_mma(Atom{}, Layout<Shape<_1,_4,_1>>{}, Tile<_16,_32,_16>{});
@@ -303,9 +312,9 @@ void qmm_sm80_kernel(
   int l_coord = int(blockIdx.z);
 
   // Define layouts (mixed).
-  auto dA = make_stride(k, Int<1>{}, m * k); // (dM,dK,dL)
-  auto dB = make_stride(k, Int<1>{}, n * k); // (dN,dK,dL)
-  auto dC = make_stride(n, Int<1>{}, m * n); // (dM,dN,dL)
+  auto dA = make_stride(k, Int<1>{}, int64_t(m) * k); // (dM,dK,dL)
+  auto dB = make_stride(k, Int<1>{}, int64_t(n) * k); // (dN,dK,dL)
+  auto dC = make_stride(n, Int<1>{}, int64_t(m) * n); // (dM,dN,dL)
   auto S_layout = make_scales_layout<GroupSize>(n, k, l);
 
   // Handle broadcasting.
@@ -388,9 +397,9 @@ void qmm_sm80_rhs_kernel(
 
   // Define layouts (mixed). All gathered rows form one matrix; each run of
   // equal rhs_indices inside the row tile reuses one expert tile.
-  auto dA = make_stride(k, Int<1>{}, m * k); // (dM,dK,dL)
-  auto dB = make_stride(k, Int<1>{}, n * k); // (dN,dK,dL)
-  auto dC = make_stride(n, Int<1>{}, m * n); // (dM,dN,dL)
+  auto dA = make_stride(k, Int<1>{}, int64_t(m) * k); // (dM,dK,dL)
+  auto dB = make_stride(k, Int<1>{}, int64_t(n) * k); // (dN,dK,dL)
+  auto dC = make_stride(n, Int<1>{}, int64_t(m) * n); // (dM,dN,dL)
   auto S_layout = make_scales_layout<GroupSize>(n, k, group_count);
 
   Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        make_shape(m, k, 1), dA); // (M,K,L)

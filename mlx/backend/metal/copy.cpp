@@ -180,10 +180,10 @@ void copy_gpu_inplace(
 }
 
 void fill_gpu(const array& val, array& out, const Stream& s) {
+  out.set_data(allocator::malloc(out.nbytes()));
   if (out.size() == 0) {
     return;
   }
-  out.set_data(allocator::malloc(out.nbytes()));
   bool large = out.data_size() > UINT32_MAX;
   int work_per_thread = get_work_per_thread(out.dtype(), out.data_size());
   auto& d = metal::device(s.device);
@@ -213,7 +213,11 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
   compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
 
-void reshape_gpu(const array& in, array& out, Stream s) {
+void reshape_gpu(
+    const array& in,
+    array& out,
+    bool add_out_to_temporary_on_allocation,
+    Stream s) {
   auto [copy_necessary, out_strides] = prepare_reshape(in, out);
   if (copy_necessary) {
     out.set_data(allocator::malloc(out.nbytes()));
@@ -227,6 +231,9 @@ void reshape_gpu(const array& in, array& out, Stream s) {
         0,
         CopyType::General,
         s);
+    if (add_out_to_temporary_on_allocation) {
+      metal::get_command_encoder(s).add_temporary(out);
+    }
   } else {
     shared_buffer_reshape(in, out_strides, out);
   }

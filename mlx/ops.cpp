@@ -334,8 +334,7 @@ array as_strided(
       dtype,
       std::make_shared<AsStrided>(
           to_stream(s), std::move(shape), std::move(strides), offset),
-      // Force the input array to be contiguous.
-      {flatten(std::move(a), s)});
+      {std::move(a)});
 }
 
 array copy(array a, StreamOrDevice s /* = {} */) {
@@ -2685,7 +2684,7 @@ std::tuple<array, array> minmax(
 
 array argmin(const array& a, bool keepdims, StreamOrDevice s /* = {} */) {
   auto result = argmin(flatten(a, s), 0, true, s);
-  if (keepdims) {
+  if (keepdims && a.ndim() > 0) {
     std::vector<int> axes(a.ndim() - 1);
     std::iota(axes.begin(), axes.end(), 0);
     result = expand_dims(result, axes, s);
@@ -2722,7 +2721,7 @@ array argmin(
 
 array argmax(const array& a, bool keepdims, StreamOrDevice s /* = {} */) {
   auto result = argmax(flatten(a, s), 0, true, s);
-  if (keepdims) {
+  if (keepdims && a.ndim() > 0) {
     std::vector<int> axes(a.ndim() - 1);
     std::iota(axes.begin(), axes.end(), 0);
     result = expand_dims(result, axes, s);
@@ -3915,8 +3914,9 @@ array take(const array& a, int index, int axis, StreamOrDevice s /* = {} */) {
         "[take] Cannot do a non-empty take from an array with zero elements.");
   }
 
-  // Handle negative axis
+  // Handle negative axis and index
   axis = axis < 0 ? a.ndim() + axis : axis;
+  index = index < 0 ? a.shape(axis) + index : index;
 
   Shape starts(a.ndim(), 0);
   Shape stops = a.shape();
@@ -4780,22 +4780,35 @@ array conv_general(
     has_neg_padding |= (pd < 0);
   }
 
-  // Handle negative padding
+  // Negative padding counts positions of the dilated input. Keep the input
+  // elements inside the window and pad the gap left before or after them.
+  bool only_padding = false;
   if (has_neg_padding) {
     Shape starts(in.ndim(), 0);
     auto stops = in.shape();
 
     for (int i = 0; i < spatial_dims; i++) {
-      if (padding_lo[i] < 0) {
-        starts[i + 1] = safe_cast(
-            starts[i + 1] - static_cast<int64_t>(padding_lo[i]), "conv");
-        padding_lo[i] = 0;
+      int64_t dil = input_dilation[i];
+      int64_t len = (in.shape(i + 1) - 1) * dil + 1;
+      int64_t lo = padding_lo[i];
+      int64_t hi = padding_hi[i];
+      int64_t start = lo < 0 ? (safe_cast(-lo, "conv") + dil - 1) / dil : 0;
+      int64_t stop = hi < 0 ? std::max<int64_t>(len + hi + dil - 1, 0) / dil
+                            : in.shape(i + 1);
+      if (stop <= start) {
+        // Only zeros are left, keep the padded size for the output shape
+        only_padding = true;
+        start = stop = 0;
+        lo = 0;
+        hi = len + padding_lo[i] + hi + dil - 1;
+      } else {
+        lo += start * dil;
+        hi += len - (stop - 1) * dil - 1;
       }
-
-      if (padding_hi[i] < 0) {
-        stops[i + 1] += padding_hi[i];
-        padding_hi[i] = 0;
-      }
+      starts[i + 1] = safe_cast(start, "conv");
+      stops[i + 1] = safe_cast(stop, "conv");
+      padding_lo[i] = safe_cast(lo, "conv");
+      padding_hi[i] = safe_cast(hi, "conv");
     }
 
     in = slice(in, std::move(starts), std::move(stops), s);
@@ -4810,6 +4823,10 @@ array conv_general(
       padding_hi,
       kernel_dilation,
       input_dilation);
+
+  if (only_padding) {
+    return zeros(std::move(out_shape), in.dtype(), s);
+  }
 
   return array(
       std::move(out_shape),
@@ -5001,6 +5018,16 @@ array quantized_matmul(
       std::move(inputs));
 }
 
+void validate_qqmm_mode(std::string_view tag, QuantizationMode qmode) {
+  // Affine mode needs biases, and qqmm does not take them.
+  if (qmode == QuantizationMode::Affine) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Only 'nvfp4', 'mxfp4' and 'mxfp8' quantization "
+        << "modes are supported but received 'affine'.";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
 void validate_qqmm_inputs(
     const array& x,
     const array& w,
@@ -5103,6 +5130,7 @@ array qqmm(
     StreamOrDevice s /* = {} */) {
   auto stream = to_stream(s);
   auto qmode = string_to_quantization_mode(mode, "qqmm");
+  validate_qqmm_mode("qqmm", qmode);
   // we need to check 2 cases:
   // 1. w is quantized, scales is provided
   // 2. w is not quantized, scales is not provided
@@ -5310,8 +5338,10 @@ std::vector<array> fp_quantize(
     auto new_shape = w.shape();
     new_shape.back() = -1;
     auto wq = reshape(w, {-1, group_size}, s);
-    auto scales =
-        divide(max(abs(wq, s), -1, true, s), array(maxval, w.dtype()), s);
+    // Skip NaN in the group max, as the GPU kernels do
+    auto w_abs = abs(wq, s);
+    w_abs = where(isnan(w_abs, s), array(0, w.dtype()), w_abs, s);
+    auto scales = divide(max(w_abs, -1, true, s), array(maxval, w.dtype()), s);
     if (group_size == 16) {
       // convert to e4m3
       auto scale_encode = inputs.size() > 1
@@ -5319,8 +5349,11 @@ std::vector<array> fp_quantize(
           : array(1.0f, float32);
       scales = multiply(scales, scale_encode, s);
       scales = to_fp8(scales, s);
-      wq = multiply(
-          divide(wq, from_fp8(scales, w.dtype(), s), s), scale_encode, s);
+      auto dec = from_fp8(scales, w.dtype(), s);
+      auto zero = array(0, dec.dtype());
+      wq = where(
+          not_equal(dec, zero, s), divide(wq, dec, s), zeros_like(wq, s), s);
+      wq = multiply(wq, scale_encode, s);
     } else {
       // convert to e8m0
       auto z = array(0, scales.dtype());
@@ -5334,33 +5367,26 @@ std::vector<array> fp_quantize(
           add(exponent, array(1, int32), s),
           exponent,
           s);
-      scales = where(equal(scales, z, s), z, exponent, s);
+      auto zero_max = equal(scales, z, s);
+      scales = where(zero_max, z, exponent, s);
 
       wq = divide(wq, power(array(2.0f, w.dtype()), scales, s), s);
       scales = astype(add(scales, array(127, int32), s), uint8, s);
+      scales = where(zero_max, array(0, uint8), scales, s);
     }
     if (bits == 4) {
-      auto lut = array({
-          +0.0f,
-          +0.5f,
-          +1.0f,
-          +1.5f,
-          +2.0f,
-          +3.0f,
-          +4.0f,
-          +6.0f,
-          -0.0f,
-          -0.5f,
-          -1.0f,
-          -1.5f,
-          -2.0f,
-          -3.0f,
-          -4.0f,
-          -6.0f,
-      });
-      lut = astype(lut, w.dtype(), s);
-      wq = argmin(
-          abs(subtract(expand_dims(wq, -1, s), lut, s), s), -1, false, s);
+      // Midpoints between the e2m1 magnitudes, ties go to the even code
+      auto mid = array({0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f});
+      mid = astype(mid, w.dtype(), s);
+      auto wa = abs(wq, s);
+      auto lo = searchsorted(mid, wa, "left", s);
+      auto hi = searchsorted(mid, wa, "right", s);
+      auto odd = astype(bitwise_and(lo, array(1, uint32), s), bool_, s);
+      auto sign_bit = multiply(
+          astype(less(wq, array(0, wq.dtype()), s), uint32, s),
+          array(8, uint32),
+          s);
+      wq = add(where(odd, hi, lo, s), sign_bit, s);
       auto shifts = power(array(2, uint32), arange(0, 32, 4, uint32, s), s);
       wq = reshape(wq, {-1, 4, 8}, s);
       wq = sum(multiply(wq, shifts, s), -1, false, s);
@@ -5625,8 +5651,10 @@ array fp_dequantize(
           : array(1.0f, out_type);
       scales = multiply(from_fp8(scales, out_type, s), inv_scale_enc, s);
     } else {
+      auto nan_mask = equal(scales, array(uint8_t(0xFF), scales.dtype()), s);
       scales = subtract(astype(scales, out_type, s), array(127, out_type), s);
       scales = power(array(2.0f, out_type), scales, s);
+      scales = where(nan_mask, array(NAN, out_type), scales, s);
     }
     return {reshape(multiply(out, scales, s), wshape, s)};
   };
@@ -5885,6 +5913,7 @@ array gather_qqmm(
     StreamOrDevice s) {
   auto stream = to_stream(s);
   auto qmode = string_to_quantization_mode(mode, "gather_qqmm");
+  validate_qqmm_mode("gather_qqmm", qmode);
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
 
@@ -6651,10 +6680,15 @@ std::vector<array> depends(
   std::vector<array> all_inputs = inputs;
   all_inputs.insert(all_inputs.end(), dependencies.begin(), dependencies.end());
 
-  // Compute the stream. Maybe do it in a smarter way at some point in the
-  // future.
-  Stream s = (inputs[0].has_primitive()) ? inputs[0].primitive().stream()
-                                         : to_stream({});
+  // Use the stream of the first input or dependency that has one.
+  std::optional<Stream> found;
+  for (auto& in : all_inputs) {
+    if (in.has_primitive()) {
+      found = in.primitive().stream();
+      break;
+    }
+  }
+  Stream s = found ? *found : to_stream({});
   // Make the output info
   std::vector<Shape> shapes;
   std::vector<Dtype> dtypes;
@@ -6758,12 +6792,13 @@ array number_of_elements(
     }
     return array(inverted ? 1.0 / numel : numel, dtype);
   }
-  return stop_gradient(array(
-      Shape{},
-      dtype,
-      std::make_shared<NumberOfElements>(
-          to_stream(s), std::move(axes), inverted, dtype),
-      {a}),
+  return stop_gradient(
+      array(
+          Shape{},
+          dtype,
+          std::make_shared<NumberOfElements>(
+              to_stream(s), std::move(axes), inverted, dtype),
+          {a}),
       s);
 }
 

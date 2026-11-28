@@ -35,7 +35,7 @@ inline int max_unfold_rows(metal::Device& d, size_t row_bytes, int total_rows) {
   size_t max_buffer = d.mtl_device()->maxBufferLength();
   size_t max_rows = row_bytes == 0 ? total_rows : max_buffer / row_bytes;
   // Force a smaller tile (tests, or to bound the unfold buffer further).
-  if (int forced = env::get_var("MLX_CONV_UNFOLD_TILE_ROWS", 0); forced > 0) {
+  if (int forced = config::get("MLX_CONV_UNFOLD_TILE_ROWS", 0); forced > 0) {
     max_rows = std::min(max_rows, static_cast<size_t>(forced));
   }
   if (max_rows == 0) {
@@ -72,7 +72,7 @@ inline int winograd_batch_step(
 
   // Limit of maximum memory can be used for the step.
   size_t working_set = d.mtl_device()->recommendedMaxWorkingSetSize();
-  if (int env_ws = env::get_var("MLX_CONV_WINOGRAD_WORKING_SET", 0);
+  if (int env_ws = config::get("MLX_CONV_WINOGRAD_WORKING_SET", 0);
       env_ws > 0) {
     working_set = env_ws;
   }
@@ -96,8 +96,7 @@ inline int winograd_batch_step(
           (conv_params.C + conv_params.O) * itemsize;
   auto max_n = static_cast<int64_t>(budget / bytes_per_n);
   int safe_n = static_cast<int>(std::min<int64_t>(max_n, total_n));
-  if (int forced = env::get_var("MLX_CONV_WINOGRAD_TILE_BATCH", 0);
-      forced > 0) {
+  if (int forced = config::get("MLX_CONV_WINOGRAD_TILE_BATCH", 0); forced > 0) {
     return std::min(forced, safe_n);
   }
 
@@ -811,8 +810,14 @@ void pad_and_slice_conv_3D_gpu(
   implicit_gemm_conv_3D_gpu(s, d, in, wt, intermediate, new_params);
 
   // Slice out
+  auto [_, row_contiguous, col_contiguous] =
+      check_contiguity(out.shape(), intermediate.strides());
+  bool contiguous = row_contiguous || col_contiguous;
   out.copy_shared_buffer(
-      intermediate, intermediate.strides(), {0}, intermediate.data_size());
+      intermediate,
+      intermediate.strides(),
+      {contiguous, row_contiguous, col_contiguous},
+      contiguous ? out.size() : intermediate.data_size());
 }
 
 void conv_2D_gpu(
@@ -974,7 +979,7 @@ void stride_two_conv_transpose_3D_gpu(
     array phase_out({M, O}, out.dtype(), nullptr, {});
     phase_out.set_data(allocator::malloc(phase_out.nbytes()));
 
-    std::vector<array> gemm_copies = {in_matrix, wt_phase};
+    std::vector<array> gemm_copies;
     steel_matmul(
         s,
         d,
@@ -1018,7 +1023,6 @@ void stride_two_conv_transpose_3D_gpu(
     copy_gpu_inplace(phase_out_nd, out_phase_view, CopyType::GeneralGeneral, s);
     copies.push_back(phase_out);
     copies.push_back(phase_out_nd);
-    copies.push_back(out_phase_view);
   }
 }
 
@@ -1452,7 +1456,7 @@ void dispatch_conv_2D_gpu(
   if (!conv_params.flip && is_stride_one && is_kdil_one && is_idil_one &&
       conv_params.wS[0] == 3 && conv_params.wS[1] == 3 &&
       conv_params.C % 32 == 0 && conv_params.O % 32 == 0 && inp_large &&
-      channels_large && env::get_var("MLX_CONV_WINOGRAD", 1)) {
+      channels_large && config::get("MLX_CONV_WINOGRAD", 1)) {
     // Only use winograd conv when having enough memory.
     if (int n_step = winograd_batch_step(d, in, conv_params); n_step > 0) {
       return winograd_conv_2D_gpu(
@@ -1753,6 +1757,19 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Some shortcuts for brevity
   const array& in = inputs[0];
   const array& wt = inputs[1];
+
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+
+  // Return 0s if either input is empty
+  if (in.size() == 0 || wt.size() == 0) {
+    array zero = array(0, out.dtype());
+    fill_gpu(zero, out, s);
+    metal::get_command_encoder(s).add_temporary(std::move(zero));
+    return;
+  }
 
   // 3D conv
   if (out.ndim() == 5) {

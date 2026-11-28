@@ -4,7 +4,7 @@
 #include <stdexcept>
 
 #include "mlx/small_m_route.h"
-#include "mlx/utils.h"
+#include "mlx/config.h"
 
 namespace mlx::core {
 
@@ -34,7 +34,7 @@ void check_scope_route(int route) {
 // scopes instead, which each op captures when it is built.
 int process_small_m_route() {
   static const int route = [] {
-    int v = env::get_var(
+    int v = config::get(
         "MLX_METAL_SMALL_M_ROW_INVARIANT", small_m_route_row_invariant);
     return (v == small_m_route_serial_only || v == small_m_route_stock_order)
         ? v

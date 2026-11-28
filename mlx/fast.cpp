@@ -716,6 +716,7 @@ array scaled_dot_product_attention(
     const array& keys,
     const array& values,
     const float scale,
+    int window_size /* = -1 */,
     const std::string& mask_mode /* = "" */,
     std::optional<array> mask_arr /* = {} */,
     const std::optional<array>& sinks /* = {} */,
@@ -729,6 +730,14 @@ array scaled_dot_product_attention(
       throw std::invalid_argument(msg.str());
     }
   }
+  if (window_size == 0 || window_size < -1) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] Invalid window_size " << window_size
+        << ". window_size must be positive or -1 for no window.";
+    throw std::invalid_argument(msg.str());
+  }
+  bool has_window = window_size > 0;
+
   // Check valid mask
   if (mask_mode != "" && mask_mode != "causal" && mask_mode != "array") {
     std::ostringstream msg;
@@ -820,6 +829,7 @@ array scaled_dot_product_attention(
                    n_q_heads,
                    n_kv_heads,
                    do_causal,
+                   window_size,
                    has_sinks,
                    has_arr_mask,
                    s](const std::vector<array>& inputs) {
@@ -833,10 +843,10 @@ array scaled_dot_product_attention(
       v = expand_dims(v, 2, s);
     }
     auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
-    if (has_arr_mask || do_causal) {
+    if (has_arr_mask || do_causal || window_size > 0) {
       // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
       auto make_or_fetch_mask = [&]() {
-        if (do_causal) {
+        if (do_causal || window_size > 0) {
           int kL = k.shape(-2);
           int qL = q.shape(-2);
           int offset = kL - qL;
@@ -844,11 +854,36 @@ array scaled_dot_product_attention(
           auto k_idx = arange(0, kL, s);
           q_idx = expand_dims(q_idx, 1, s);
           k_idx = expand_dims(k_idx, 0, s);
+
+          if (window_size > 0) {
+            auto dist = abs(subtract(q_idx, k_idx, s), s);
+            auto window_mask = less(dist, array(window_size, dist.dtype()), s);
+
+            if (do_causal) {
+              auto causal_mask = greater_equal(q_idx, k_idx, s);
+              window_mask = logical_and(window_mask, causal_mask, s);
+            }
+
+            return window_mask;
+          }
+
           return greater_equal(q_idx, k_idx, s);
         }
         return inputs[3];
       };
       auto mask = make_or_fetch_mask();
+
+      // If we have an array mask on top of a built mask
+      if ((do_causal || window_size > 0) && has_arr_mask) {
+        auto arr_mask = inputs[3];
+
+        if (arr_mask.dtype() == bool_) {
+          mask = logical_and(mask, arr_mask, s);
+        } else {
+          auto minarr = array(finfo(scores.dtype()).min, scores.dtype());
+          mask = where(mask, arr_mask, minarr, s);
+        }
+      }
 
       if (n_repeats > 1 && mask.ndim() >= 3) {
         if (mask.shape(-3) == 1) {
@@ -935,19 +970,24 @@ array scaled_dot_product_attention(
           has_arr_mask,
           do_causal,
           has_sinks,
+          window_size,
           is_training,
           output_logsumexp,
           force_fused,
           stream)) {
     if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
-      // Convert bool mask to additive mask.
+      // Convert bool mask to additive mask before the broadcast, so it is not
+      // copied for each head. The fused kernel needs a contiguous last axis.
       float inf = std::numeric_limits<float>::infinity();
-      array& mask = inputs[3];
-      mask = where(
-          mask,
-          full_like(mask, 0, final_type, stream),
-          full_like(mask, -inf, final_type, stream),
+      auto shape = mask_arr->ndim() > 0 ? mask_arr->shape() : Shape{1};
+      shape.back() = keys.shape(-2);
+      auto mask = where(
+          broadcast_to(*mask_arr, shape, stream),
+          array(0.0f, final_type),
+          array(-inf, final_type),
           stream);
+      mask = contiguous(mask, false, stream);
+      inputs[3] = broadcast_to(mask, inputs[3].shape(), stream);
     }
     Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
     auto primitive = std::make_shared<ScaledDotProductAttention>(
@@ -956,6 +996,7 @@ array scaled_dot_product_attention(
         scale,
         do_causal,
         has_sinks,
+        window_size,
         output_logsumexp,
         force_fused);
     if (output_logsumexp) {
@@ -985,14 +1026,18 @@ std::vector<array> ScaledDotProductAttention::vjp(
     return Custom::vjp(primals, cotangents, argnums, outputs);
   }
 
-  if (outputs.size() != 2) {
+  // The fused backward computes only the gradients of q, k and v.
+  bool other_grads = std::any_of(
+      argnums.begin(), argnums.end(), [](int arg) { return arg >= 3; });
+  if (outputs.size() != 2 || other_grads) {
     return Custom::vjp(primals, cotangents, argnums, outputs);
   }
 
+  // The inputs are the primals, the output, the logsumexp and the cotangent.
   auto fallback = [sdpa = fallback_, s](const std::vector<array>& inputs) {
-    std::vector<array> primals(inputs.begin(), std::prev(inputs.end()));
+    std::vector<array> primals(inputs.begin(), inputs.end() - 3);
     auto [_, vjps] = mlx::core::vjp(sdpa, primals, {inputs.back()});
-    return vjps;
+    return std::vector<array>(vjps.begin(), vjps.begin() + 3);
   };
 
   std::vector<Shape> shapes;
@@ -1002,7 +1047,7 @@ std::vector<array> ScaledDotProductAttention::vjp(
     dtypes.push_back(primals[i].dtype());
   }
   auto primitive = std::make_shared<ScaledDotProductAttentionVJP>(
-      s, fallback, scale_, do_causal_, has_sinks_);
+      s, fallback, scale_, do_causal_, has_sinks_, window_size_);
   std::vector<array> inputs = primals;
   inputs.push_back(outputs[0]);
   inputs.push_back(outputs[1]);
@@ -1011,11 +1056,6 @@ std::vector<array> ScaledDotProductAttention::vjp(
 
   std::vector<array> returned_vjps;
   for (int arg : argnums) {
-    if (arg >= 3) {
-      throw std::invalid_argument(
-          "[scale_dot_product_attention] Does not support VJP with respect "
-          " to mask or attention sinks.");
-    }
     returned_vjps.push_back(std::move(vjps[arg]));
   }
   return returned_vjps;
@@ -1026,6 +1066,7 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
       static_cast<const ScaledDotProductAttention&>(other);
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
       has_sinks_ == a_other.has_sinks_ &&
+      window_size_ == a_other.window_size_ &&
       output_logsumexp_ == a_other.output_logsumexp_ &&
       force_fused_ == a_other.force_fused_;
 }
@@ -1034,7 +1075,7 @@ bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
   const ScaledDotProductAttentionVJP& a_other =
       static_cast<const ScaledDotProductAttentionVJP&>(other);
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
-      has_sinks_ == a_other.has_sinks_;
+      has_sinks_ == a_other.has_sinks_ && window_size_ == a_other.window_size_;
 }
 
 std::vector<array> gated_delta_update(
@@ -1058,8 +1099,10 @@ std::vector<array> gated_delta_update(
   auto q = astype(queries, out_dtype, s);
   auto k = astype(keys, out_dtype, s);
   auto v = astype(values, out_dtype, s);
-  auto g = astype(gates, out_dtype, s);
-  auto beta = astype(beta_, out_dtype, s);
+  // The decay sits close to 1, where a 16-bit type has too few mantissa
+  // bits, so gates and beta stay float32 regardless of the type of q.
+  auto g = astype(gates, float32, s);
+  auto beta = astype(beta_, float32, s);
 
   int B = q.shape(0);
   int T = q.shape(1);
@@ -1149,20 +1192,19 @@ std::vector<array> gated_delta_update(
     return std::vector<array>{out, state};
   };
 
-  if (!GatedDeltaUpdate::use_fallback(Hk, Dk, Hv, Dv, has_mask, s)) {
-    auto result = array::make_arrays(
-        /* output shapes */ {{B, T, Hv, Dv}, {B, Hv, Dv, Dk}},
-        /* dtypes */ {out_dtype, float32},
-        /* primitive */
-        std::make_shared<GatedDeltaUpdate>(s, fallback),
-        /* inputs */ {q, k, v, g, beta, h0});
-
-    return result;
+  if (GatedDeltaUpdate::use_fallback(Hk, Dk, Hv, Dv, has_mask, s) ||
+      config::get("MLX_GATED_DELTA_FALLBACK", 0)) {
+    return fallback({q, k, v, g, beta, h0, mask});
   }
 
-  auto result = fallback({q, k, v, g, beta, h0, mask});
-  return result;
+  return array::make_arrays(
+      /* output shapes */ {{B, T, Hv, Dv}, {B, Hv, Dv, Dk}},
+      /* dtypes */ {out_dtype, float32},
+      /* primitive */
+      std::make_shared<GatedDeltaUpdate>(s, fallback),
+      /* inputs */ {q, k, v, g, beta, h0});
 }
+
 std::vector<array> GatedDeltaUpdate::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -1173,7 +1215,8 @@ std::vector<array> GatedDeltaUpdate::vjp(
   const int Hv = primals[2].shape(2);
   const int Dv = primals[2].shape(3);
 
-  if (GatedDeltaUpdateVJP::use_fallback(Hk, Dk, Hv, Dv, stream())) {
+  if (GatedDeltaUpdateVJP::use_fallback(Hk, Dk, Hv, Dv, stream()) ||
+      config::get("MLX_GATED_DELTA_VJP_FALLBACK", 0)) {
     return Custom::vjp(primals, cotangents, argnums, outputs);
   }
 

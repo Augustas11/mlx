@@ -3,7 +3,7 @@
 #include <optional>
 #include <variant>
 
-#include "mlx/backend/common/metal_kernel.h"
+#include "mlx/backend/common/custom_kernel.h"
 #include "mlx/primitives.h"
 
 namespace mlx::core::fast {
@@ -273,12 +273,14 @@ class ScaledDotProductAttention : public Custom {
       float scale,
       bool do_causal,
       bool has_sinks,
+      int window_size,
       bool output_logsumexp,
       bool force_fused)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         do_causal_(do_causal),
         has_sinks_(has_sinks),
+        window_size_(window_size),
         output_logsumexp_(output_logsumexp),
         force_fused_(force_fused) {}
 
@@ -290,6 +292,7 @@ class ScaledDotProductAttention : public Custom {
       bool has_arr_mask,
       bool do_causal,
       bool has_sinks,
+      int window_size,
       bool is_training,
       bool output_logsumexp,
       bool force_fused,
@@ -320,6 +323,7 @@ class ScaledDotProductAttention : public Custom {
         scale_,
         do_causal_,
         has_sinks_,
+        window_size_,
         output_logsumexp_,
         force_fused_);
   }
@@ -328,6 +332,7 @@ class ScaledDotProductAttention : public Custom {
   float scale_;
   bool do_causal_;
   bool has_sinks_;
+  int window_size_;
   bool output_logsumexp_;
   bool force_fused_;
 };
@@ -339,11 +344,13 @@ class ScaledDotProductAttentionVJP : public Custom {
       std::function<std::vector<array>(std::vector<array>)> fallback,
       float scale,
       bool do_causal,
-      bool has_sinks)
+      bool has_sinks,
+      int window_size)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         do_causal_(do_causal),
-        has_sinks_(has_sinks) {}
+        has_sinks_(has_sinks),
+        window_size_(window_size) {}
 
   static bool use_fallback(const array& q, Stream s);
 
@@ -358,13 +365,15 @@ class ScaledDotProductAttentionVJP : public Custom {
   DEFINE_NAME(ScaledDotProductAttentionVJP);
   bool is_equivalent(const Primitive& other) const override;
   auto state() const {
-    return std::make_tuple(nullptr, scale_, do_causal_, has_sinks_);
+    return std::make_tuple(
+        nullptr, scale_, do_causal_, has_sinks_, window_size_);
   }
 
  private:
   float scale_;
   bool do_causal_;
   bool has_sinks_;
+  int window_size_;
 };
 
 class ConvertFP8 : public Primitive {
@@ -403,13 +412,8 @@ class GatedDeltaUpdate : public Custom {
       std::function<std::vector<array>(std::vector<array>)> fallback)
       : Custom(stream, std::move(fallback)) {}
 
-  static bool use_fallback(
-      const int Hk,
-      const int Dk,
-      const int Hv,
-      const int Dv,
-      const bool has_mask,
-      Stream s);
+  static bool
+  use_fallback(int Hk, int Dk, int Hv, int Dv, bool has_mask, Stream s);
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -442,12 +446,7 @@ class GatedDeltaUpdateVJP : public Custom {
       std::function<std::vector<array>(std::vector<array>)> fallback)
       : Custom(stream, std::move(fallback)) {}
 
-  static bool use_fallback(
-      const int Hk,
-      const int Dk,
-      const int Hv,
-      const int Dv,
-      Stream s);
+  static bool use_fallback(int Hk, int Dk, int Hv, int Dv, Stream s);
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -511,6 +510,7 @@ class CustomKernel : public Primitive {
       Stream stream,
       std::string name,
       std::string source,
+      size_t source_hash,
       std::tuple<int, int, int> grid,
       std::tuple<int, int, int> threadgroup,
       std::vector<std::tuple<bool, bool, bool>> shape_infos,
@@ -523,6 +523,7 @@ class CustomKernel : public Primitive {
       : Primitive(stream),
         name_(std::move(name)),
         source_(std::move(source)),
+        source_hash_(source_hash),
         grid_(grid),
         threadgroup_(threadgroup),
         shape_infos_(std::move(shape_infos)),
@@ -546,6 +547,7 @@ class CustomKernel : public Primitive {
     return std::make_tuple(
         name_,
         source_,
+        source_hash_,
         grid_,
         threadgroup_,
         shape_infos_,
@@ -560,6 +562,7 @@ class CustomKernel : public Primitive {
  private:
   std::string name_;
   std::string source_;
+  size_t source_hash_;
   std::tuple<int, int, int> grid_;
   std::tuple<int, int, int> threadgroup_;
   std::vector<std::tuple<bool, bool, bool>> shape_infos_;

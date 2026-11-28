@@ -244,6 +244,9 @@ void quantize_impl(
     Stream s) {
   auto& w_pre = inputs[0];
   auto& out = outputs[0];
+  if (w_pre.size() == 0) {
+    return;
+  }
 
   auto& d = metal::device(s.device);
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -288,10 +291,8 @@ void quantize_impl(
       "_gs_",
       group_size,
       "_b_",
-      bits);
-  if (!has_biases) {
-    concatenate(kname, "_hgs_", has_global_scale ? "true" : "false");
-  }
+      bits,
+      has_global_scale ? "_hgs_1" : "_hgs_0");
   auto kernel = get_quantized_kernel_wrapped(
       d,
       kname,
@@ -364,8 +365,7 @@ void fp_quantize_dequantize(
       group_size,
       "_b_",
       bits,
-      "_hgs_",
-      global_scale ? "true" : "false");
+      global_scale ? "_hgs_1" : "_hgs_0");
   auto kernel = get_quantized_kernel_wrapped(
       d,
       kname,
@@ -505,9 +505,9 @@ void qmv(
       group_size,
       "_b_",
       bits,
+      global_scale ? "_hgs_1" : "_hgs_0",
       B > 1 ? "_batch_1" : "_batch_0",
       partial_rows ? "_pr_1" : "_pr_0",
-      global_scale ? "_hgs_1" : "_hgs_0",
       "_r_",
       results_per_simdgroup);
   auto kernel = get_quantized_kernel_wrapped(
@@ -518,9 +518,9 @@ void qmv(
       type_string,
       group_size,
       bits,
+      global_scale.has_value(),
       B > 1,
       partial_rows,
-      global_scale.has_value(),
       results_per_simdgroup);
 
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -565,9 +565,10 @@ void qmv_wide(
     const Stream& s,
     const std::string& mode) {
   // vecs_per_tg is the per-threadgroup input-vector tile. Each tile re-reads
-  // the weights, so use the fewest tiles, then the smallest tile that fills
-  // them.
-  int n_tiles = (M + 4) / 5; // ceil(M / 5); tile size caps at 5
+  // the weights, and the affine kernel keeps every streamed vector in
+  // registers, so use one tile up to the widest tile that still fits.
+  int tile_cap = mode == "affine" ? 8 : 5;
+  int n_tiles = (M + tile_cap - 1) / tile_cap;
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
 
   // k_lanes: lanes reducing K per output row (32/k_lanes rows per simdgroup).
@@ -633,11 +634,177 @@ void qmv_wide(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+inline bool use_qmv_mma(
+    const array& x,
+    const array& w,
+    const array& scales,
+    QuantizationMode mode,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d) {
+  bool nax = metal::is_nax_available();
+  bool affine = mode == QuantizationMode::Affine;
+  // affine_qmv_mma beats qmv from 3 rows on gen 13 and 14 GPUs (4 on their
+  // Ultras) and qmv_wide from 4 rows on gen 15 and above. 4-bit
+  // affine_qmv_nax from 4 rows; the other paths from 6.
+  bool ultra = d.get_architecture().back() == 'd';
+  int min_rows = 6;
+  if (affine && !nax) {
+    min_rows = (ultra || d.get_architecture_gen() >= 15) ? 4 : 3;
+  } else if (affine && bits == 4) {
+    min_rows = 4;
+  }
+  if ((M < min_rows) || (K % 128 != 0)) {
+    return false;
+  }
+  // Require aligned vector load.
+  if ((x.offset() % (8 * x.itemsize())) || (w.offset() % 16) ||
+      (scales.offset() % 2)) {
+    return false;
+  }
+  // Route for large K/N.
+  if (affine) {
+    if (nax) {
+      // qmv_nax reads affine weights with 3 to 8 bits.
+      return (bits >= 3 && bits != 7) &&
+          (x.dtype() == float16 || x.dtype() == bfloat16) && (N >= 512) &&
+          (K >= 1024) && (N % 32 == 0);
+    } else { // non-nax
+      // qmv_mma reads 2 to 8 bits (not 7).
+      if (bits < 2 || bits == 7) {
+        return false;
+      }
+      // On M3 Ultra and newer, as for fp, only for large layers.
+      if (ultra && d.get_architecture_gen() >= 15) {
+        return (N >= 4096) && (K >= 4096) && (N % 16 == 0);
+      }
+      // Affine pays off from a smaller N * K than fp, and from 2^20 on gen 15+
+      // (M4).
+      int nk_log2 = d.get_architecture_gen() >= 15 ? 20 : 21;
+      return (N >= 512) && (K >= 512) &&
+          (int64_t(N) * K >= (int64_t(1) << nk_log2)) && (N % 16 == 0);
+    }
+  } else { // fp quantization
+    if (nax) {
+      // Below 2048, nvfp4 with few rows is faster on qmv_wide, which runs for
+      // M < 8 or M * N < 16384.
+      bool nvfp4_wide = (mode == QuantizationMode::Nvfp4) &&
+          (M < 8 || (M < 12 && M * N < 16384));
+      int min_size = nvfp4_wide ? 2048 : 1024;
+      return (env::enable_tf32() || x.dtype() != float32) && (N >= min_size) &&
+          (K >= min_size) && (N % 32 == 0);
+    } else { // non-nax
+      if (d.get_architecture().back() == 'd') {
+        return (N >= 4096) && (K >= 4096) && (N % 16 == 0);
+      }
+      return (N >= 512) && (K >= 512) &&
+          (int64_t(N) * K >= (int64_t(1) << 22)) && (N % 16 == 0);
+    }
+  }
+}
+
+void qmv_mma(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode,
+    int affine_wk = 0) {
+  bool nax = metal::is_nax_available();
+  bool affine = (mode == "affine");
+  int wk = 4;
+  int bn = 16;
+  int tm = (M > 8) ? 2 : 1;
+  if (nax) {
+    wk = 8;
+    bn = 32;
+  } else { // non-nax
+    // Affine stays at wk 4 on gen-15+ too (wk 8 was no faster on M4).
+    if (!affine && (d.get_architecture_gen() >= 15)) {
+      wk = 8;
+    }
+    // Below gen 15, affine with one row tile is faster at 32 columns (M2 Pro).
+    if (affine && (d.get_architecture_gen() < 15) && (tm == 1) &&
+        (N % 32 == 0)) {
+      bn = 32;
+    }
+    // macprovider: the small-row route passes its WK (qmv_mma_partial_sums,
+    // captured on the op as qmv_mma_wk_); 0 keeps the choice above. WK sets a
+    // row's K reduction order and must match qmv_mma1; bn and tm only pick
+    // how many columns and rows one threadgroup covers.
+    if (affine && affine_wk != 0) {
+      wk = affine_wk;
+    }
+  }
+
+  std::string type_string = get_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      mode,
+      nax ? "_qmv_nax_" : "_qmv_mma_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_wk_",
+      wk,
+      "_bn_",
+      bn);
+  MTL::ComputePipelineState* kernel;
+  if (nax) {
+    kernel = get_qmm_nax_kernel_wrapped(
+        d, kname, "qmv_nax", mode, type_string, group_size, bits, wk, bn);
+  } else {
+    concatenate(kname, "_tm_", tm);
+    kernel = get_quantized_kernel_wrapped(
+        d, kname, "qmv_mma", mode, type_string, group_size, bits, wk, bn, tm);
+  }
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases) {
+    compute_encoder.set_input_array(*biases, c++);
+  }
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  // macprovider: affine_qmv_mma tiles the rows 8 * tm at a time over grid y,
+  // so the small-row route can send it more than 16 rows; upstream's calls
+  // (M <= 16) get one grid row as before. qmv_nax takes one grid row.
+  int rows_per_tg = 8 * tm;
+  int grid_y = nax ? 1 : (M + rows_per_tg - 1) / rows_per_tg;
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(N / bn, grid_y, 1), MTL::Size(32, wk, 1));
+}
+
 // macprovider: MLX_METAL_SMALL_M_ROW_INVARIANT selects the small-M route of
 // the weights use_affine_qmv_mma accepts:
 //   unset or 1 (or any value other than 0 and 2): the row-invariant
 //     qmv_mma1 / qmv_mma pair for 1..16 rows;
-//   0: the upstream routes (qmv / qmm);
+//   0: the upstream routes: since the v0.32.5 merge, upstream's own
+//     dispatch_qmm_t for transposed weights (qmv / qmv_wide / qmv_mma /
+//     split-K qmm, chosen by row count), see QuantizedMatmul::eval_gpu. The
+//     route 0 timings below were taken on the v0.32.4 fork's per-row route;
+//     they were not re-measured on v0.32.5's;
 //   2: "stock order": 1 row takes the upstream route; exactly 2 rows run the
 //     upstream one-row kernel's per-row arithmetic (affine_qmv_fast_rows
 //     where one row takes qmv_fast, affine_qmv with the row in the grid
@@ -698,8 +865,9 @@ inline bool use_affine_qmv_mma(
   // macprovider: the row-invariant window exists so a row decodes to the same
   // bits alone and inside a batch. A process that never puts two decode rows
   // in one product for its whole lifetime does not need it and can start with
-  // MLX_METAL_SMALL_M_ROW_INVARIANT=0 to take the per-row qmv / qmm route
-  // below, which is what upstream runs and is faster at one row. The default
+  // MLX_METAL_SMALL_M_ROW_INVARIANT=0 to take upstream's routes
+  // (dispatch_qmm_t; QuantizedMatmul::eval_gpu sends route 0 there before
+  // this test), which are faster at one row. The default
   // keeps the window, so leaving the variable unset can cost speed, never a
   // row's bits. Route 0 is process-wide only (a scope cannot select it).
   if (route == small_m_route_serial_only) {
@@ -737,82 +905,18 @@ inline bool use_affine_qmv_mma(
 // output, so it is a function of the route alone within a process (the GPU
 // generation and the variable are read once). quantized_matmul captures it on
 // the QuantizedMatmul next to the route when the op is built
-// (qmv_mma_wk_), and both kernels take that value. The kernel names carry
+// (qmv_mma_wk_), and both kernels take that value (qmv_mma through its
+// affine_wk argument). The kernel names carry
 // WK (qmv_mma always, qmv_mma1 when WK != 4), so the pipelines of both
 // routes coexist in one process.
 int metal::qmv_mma_partial_sums(int route) {
   static const int gen =
       metal::device(mlx::core::Device::gpu).get_architecture_gen();
-  static const int env_wk = env::get_var("MLX_METAL_QMV_MMA_WK", 0);
+  static const int env_wk = config::get("MLX_METAL_QMV_MMA_WK", 0);
   const int fallback =
       (route == small_m_route_stock_order && (gen == 13 || gen == 15)) ? 8
                                                                          : 4;
   return (env_wk == 4 || env_wk == 8 || env_wk == 16) ? env_wk : fallback;
-}
-
-void qmv_mma(
-    const array& x,
-    const array& w,
-    const array& scales,
-    const std::optional<array>& biases,
-    array& out,
-    int group_size,
-    int bits,
-    int M,
-    int N,
-    int K,
-    metal::Device& d,
-    const Stream& s,
-    const std::string& mode,
-    int wk) {
-  // wk sets a row's K reduction order and must match qmv_mma1; the row
-  // tiling never changes it, tm and bn only pick how many rows and columns
-  // one threadgroup covers. The threadgroup is 32 wk threads (at most 512).
-  int tm = (M > 8) ? 2 : 1;
-  int bn = 16;
-  // Below gen 15, affine with one row tile is faster at 32 columns (M2 Pro).
-  if ((d.get_architecture_gen() < 15) && (tm == 1) && (N % 32 == 0)) {
-    bn = 32;
-  }
-
-  std::string type_string = get_type_string(x.dtype());
-  std::string kname;
-  kname.reserve(64);
-  concatenate(
-      kname,
-      mode,
-      "_qmv_mma_",
-      type_string,
-      "_gs_",
-      group_size,
-      "_b_",
-      bits,
-      "_wk_",
-      wk,
-      "_bn_",
-      bn,
-      "_tm_",
-      tm);
-  auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmv_mma", mode, type_string, group_size, bits, wk, bn, tm);
-
-  auto& compute_encoder = metal::get_command_encoder(s);
-  compute_encoder.set_compute_pipeline_state(kernel);
-  int c = 0;
-  compute_encoder.set_input_array(w, c++);
-  compute_encoder.set_input_array(scales, c++);
-  if (biases) {
-    compute_encoder.set_input_array(*biases, c++);
-  }
-  compute_encoder.set_input_array(x, c++);
-  compute_encoder.set_output_array(out, c++);
-  compute_encoder.set_bytes(K, c++);
-  compute_encoder.set_bytes(N, c++);
-  compute_encoder.set_bytes(M, c++);
-  int rows_per_tg = 8 * tm;
-  compute_encoder.dispatch_threadgroups(
-      MTL::Size(N / bn, (M + rows_per_tg - 1) / rows_per_tg, 1),
-      MTL::Size(32, wk, 1));
 }
 
 // macprovider: rows up to this count take qmv_mma1, more rows take qmv_mma.
@@ -942,7 +1046,7 @@ void qmv_fast_rows(
       MTL::Size((M + mr - 1) / mr, N / 8, 1), MTL::Size(32, 2, 1));
 }
 
-void qvm_split_k(
+void qvm_splitk(
     array x,
     const array& w,
     const array& scales,
@@ -1022,7 +1126,7 @@ void qvm_split_k(
   kname.reserve(64);
   concatenate(
       kname,
-      mode + "_qvm_split_k_",
+      mode + "_qvm_splitk_",
       type_string,
       "_gs_",
       group_size,
@@ -1033,7 +1137,7 @@ void qvm_split_k(
 
   // Encode and dispatch kernel
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qvm_split_k", mode, type_string, group_size, bits, split_k);
+      d, kname, "qvm_splitk", mode, type_string, group_size, bits, split_k);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1107,8 +1211,8 @@ void qvm(
       group_size,
       "_b_",
       bits,
-      B > 1 ? "_batch_1" : "_batch_0",
-      global_scale ? "_hgs" : "");
+      global_scale ? "_hgs_1" : "_hgs_0",
+      B > 1 ? "_batch_1" : "_batch_0");
   auto kernel = get_quantized_kernel_wrapped(
       d,
       kname,
@@ -1117,8 +1221,8 @@ void qvm(
       type_string,
       group_size,
       bits,
-      B > 1,
-      global_scale.has_value());
+      global_scale.has_value(),
+      B > 1);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1137,6 +1241,15 @@ void qvm(
   add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c++);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+bool use_qmm_t_nax_staged(
+    const array& x,
+    bool transpose,
+    bool aligned_n,
+    bool has_global_scale) {
+  return transpose && aligned_n && !has_global_scale &&
+      (x.dtype() == float16 || x.dtype() == bfloat16) && (x.offset() % 8 == 0);
 }
 
 void qmm_nax(
@@ -1159,17 +1272,24 @@ void qmm_nax(
 
   int wm = 2;
   int wn = 2;
+  MTL::Size group_dims(32, wn, wm);
   // Use smaller bm when one block covers all of M. Only qmm_t_nax has a 32-row
   // instantiation.
   int bm = (transpose && M <= 32) ? 32 : 64;
   int bn = 64;
   int bk = 64;
-  MTL::Size group_dims(32, wn, wm);
-  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+
+  bool aligned_n = transpose && (N % bn == 0);
+  if (use_qmm_t_nax_staged(x, transpose, aligned_n, global_scale.has_value())) {
+    wm = 4;
+    wn = 1;
+    bm = 64;
+    // A flat threadgroup runs the 16-row schedule faster than (32, 1, wm).
+    group_dims = MTL::Size(32 * wm, 1, 1);
+  }
 
   std::string kname;
   kname.reserve(64);
-  bool aligned = N % 64 == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
   concatenate(
@@ -1180,54 +1300,34 @@ void qmm_nax(
       group_size,
       "_b_",
       bits,
-      "_bm",
-      bm,
-      "_bn",
-      bn,
-      "_bk",
-      bk,
-      "_wm",
-      wm,
-      "_wn",
-      wn,
-      transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
+      global_scale ? "_hgs_1" : "_hgs_0",
+      aligned_n ? "_alN_1" : "_alN_0",
       batched ? "_batch_1" : "_batch_0",
-      global_scale ? "_hgs" : "");
+      "_bm_",
+      bm,
+      "_bn_",
+      bn,
+      "_wm_",
+      wm,
+      "_wn_",
+      wn);
   std::string template_def;
-  MTL::ComputePipelineState* kernel;
-  if (transpose) {
-    kernel = get_qmm_nax_kernel_wrapped(
-        d,
-        kname,
-        "qmm_t_nax",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        aligned,
-        batched,
-        bm,
-        bk,
-        bn,
-        wm,
-        wn,
-        global_scale.has_value());
-  } else {
-    kernel = get_qmm_nax_kernel_wrapped(
-        d,
-        kname,
-        "qmm_n_nax",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        batched,
-        bm,
-        bk,
-        bn,
-        wm,
-        wn);
-  }
+  MTL::ComputePipelineState* kernel = get_qmm_nax_kernel_wrapped(
+      d,
+      kname,
+      transpose ? "qmm_t_nax" : "qmm_n_nax",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      global_scale.has_value(),
+      aligned_n,
+      batched,
+      bm,
+      bk,
+      bn,
+      wm,
+      wn);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1249,7 +1349,8 @@ void qmm_nax(
   compute_encoder.set_bytes(M, c++);
   add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
 
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(ceildiv(N, bn), ceildiv(M, bm), B), group_dims);
 }
 
 void gather_qmm_nax(
@@ -1284,7 +1385,7 @@ void gather_qmm_nax(
 
   std::string kname;
   kname.reserve(64);
-  bool aligned = N % 64 == 0;
+  bool aligned_n = transpose && (N % bn == 0);
   std::string type_string = get_type_string(x.dtype());
   concatenate(
       kname,
@@ -1294,50 +1395,33 @@ void gather_qmm_nax(
       group_size,
       "_b_",
       bits,
-      "_bm",
+      global_scale ? "_hgs_1" : "_hgs_0",
+      aligned_n ? "_alN_1" : "_alN_0",
+      "_batch_0",
+      "_bm_",
       bm,
-      "_bn",
+      "_bn_",
       bn,
-      "_bk",
-      bk,
-      "_wm",
+      "_wm_",
       wm,
-      "_wn",
-      wn,
-      transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-      global_scale ? "_hgs" : "");
-  MTL::ComputePipelineState* kernel;
-  if (transpose) {
-    kernel = get_qmm_nax_kernel_wrapped(
-        d,
-        kname,
-        "gather_qmm_t_nax",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        aligned,
-        bm,
-        bk,
-        bn,
-        wm,
-        wn,
-        global_scale.has_value());
-  } else {
-    kernel = get_qmm_nax_kernel_wrapped(
-        d,
-        kname,
-        "gather_qmm_n_nax",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        bm,
-        bk,
-        bn,
-        wm,
-        wn);
-  }
+      "_wn_",
+      wn);
+  MTL::ComputePipelineState* kernel = get_qmm_nax_kernel_wrapped(
+      d,
+      kname,
+      transpose ? "gather_qmm_t_nax" : "gather_qmm_n_nax",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      global_scale.has_value(),
+      aligned_n,
+      false, // batch
+      bm,
+      bk,
+      bn,
+      wm,
+      wn);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -1363,6 +1447,7 @@ void gather_qmm_nax(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Must match use_fp4_half_loader in fp_quantized.h.
 // macprovider (#2451): the dense transposed qmm takes a 64-row tile (BM = 64,
 // BK = 32, BN = 32, WM = WN = 2) instead of the stock 32 rows for affine
 // bfloat16 weights at group size 64 and 4, 6 or 8 bits, from
@@ -1386,10 +1471,19 @@ int metal::qmm_t_block_rows(
     int group_size,
     int bits,
     int M) {
-  static const bool stock = env::get_var("MLX_METAL_QMM_STOCK_TILE", 0) != 0;
+  static const bool stock = config::get("MLX_METAL_QMM_STOCK_TILE", 0) != 0;
   const bool tiled = !stock && affine_bfloat16 && group_size == 64 &&
       (bits == 4 || bits == 6 || bits == 8) && M >= qmm_t_bm64_min_rows;
   return tiled ? 64 : 32;
+}
+
+inline bool use_fp4_half_loader(
+    const array& x,
+    const std::string& mode,
+    const std::optional<array>& global_scale,
+    int bits) {
+  return (mode != "affine") && !global_scale && (bits == 4) &&
+      (x.dtype() == float16 || (x.dtype() == bfloat16 && mode == "nvfp4"));
 }
 
 void qmm(
@@ -1439,19 +1533,35 @@ void qmm(
 
   int wm = 2;
   int wn = 2;
+  int bm = 32;
+  int bk = 32;
+  int bn = 32;
+
+  // Tune for larger tile with Fp4HalfLoader.
+  if (use_fp4_half_loader(x, mode, global_scale, bits) && transpose) {
+    bool ultra = d.get_architecture().back() == 'd';
+    bool pad_free = (ceildiv(M, 32) % 2) == 0;
+    bool pad_ok = M > ((d.get_architecture_gen() < 15 && !ultra) ? 256 : 2048);
+    int tgs_64 = ceildiv(N, 64) * ceildiv(M, 64) * B;
+    int min_tgs_64 = ultra ? 1024 : 160;
+    if ((pad_free || pad_ok) && (tgs_64 >= min_tgs_64)) {
+      bm = 64;
+      bn = 64;
+    }
+  }
   // macprovider (#2451): 64 rows per tile in the measured envelope, see
   // qmm_t_block_rows. The grid's row count and the kernel's BM follow bm.
-  int bm = (transpose && !global_scale)
-      ? metal::qmm_t_block_rows(
-            mode == "affine" && x.dtype() == bfloat16, group_size, bits, M)
-      : 32;
-  int bn = 32;
+  if (transpose && !global_scale && bm == 32) {
+    bm = metal::qmm_t_block_rows(
+        mode == "affine" && x.dtype() == bfloat16, group_size, bits, M);
+  }
+
   MTL::Size group_dims(32, wn, wm);
-  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+  MTL::Size grid_dims(ceildiv(N, bn), ceildiv(M, bm), B);
 
   std::string kname;
   kname.reserve(64);
-  bool aligned = N % bn == 0;
+  bool aligned_n = transpose && (N % bn == 0);
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
   concatenate(
@@ -1462,45 +1572,28 @@ void qmm(
       group_size,
       "_b_",
       bits,
-      transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
+      global_scale ? "_hgs_1" : "_hgs_0",
+      aligned_n ? "_alN_1" : "_alN_0",
       batched ? "_batch_1" : "_batch_0",
-      global_scale ? "_hgs" : "");
-  if (bm != 32) {
-    concatenate(kname, "_bm_", bm, "_bk_32_bn_", bn);
-  }
+      "_bm_",
+      bm,
+      "_bn_",
+      bn);
   std::string template_def;
-  MTL::ComputePipelineState* kernel;
-  if (bm != 32) {
-    kernel = get_quantized_kernel_wrapped(
-        d,
-        kname,
-        "qmm_t",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        aligned,
-        batched,
-        false,
-        bm,
-        32,
-        bn);
-  } else if (transpose) {
-    kernel = get_quantized_kernel_wrapped(
-        d,
-        kname,
-        "qmm_t",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        aligned,
-        batched,
-        global_scale.has_value());
-  } else {
-    kernel = get_quantized_kernel_wrapped(
-        d, kname, "qmm_n", mode, type_string, group_size, bits, batched);
-  }
+  MTL::ComputePipelineState* kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      transpose ? "qmm_t" : "qmm_n",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      global_scale.has_value(),
+      aligned_n,
+      batched,
+      bm,
+      bk,
+      bn);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1525,6 +1618,172 @@ void qmm(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+bool use_qmm_nax_splitk(const array& x, int M, int N, int K, int group_size) {
+  // Use split-k for transposed weights with aligned N and K.
+  if (!metal::is_nax_available() ||
+      (x.dtype() == float32 && !env::enable_tf32() || (N % 64 != 0) ||
+       (K % 64 != 0) || (K % group_size != 0))) {
+    return false;
+  }
+  // A two-way K split must fit within 256 threadgroups.
+  int bm = (M <= 32) ? 32 : 64;
+  int tiles = (N / 64) * ceildiv(M, bm);
+  return (tiles * 2 <= 256) && (K % (2 * std::max(64, group_size)) == 0);
+}
+
+// K partitions for the NAX split-K launch over 64 x 64 output tiles.
+int qmm_nax_k_partitions(int M, int N, int K, int group_size) {
+  int tiles = (N / 64) * ceildiv(M, 64);
+  int k_align = std::max(64, group_size);
+  int max_tgs = 256; // fallback
+  if (int cores = metal::gpu_core_count(); cores > 0) {
+    // About 6 threadgroups per GPU core, more for long K, at most 256.
+    max_tgs = std::min(256, 6 * cores * std::max(K, 2048) / 2048);
+  }
+  int split_k = 1;
+  // Double up to 4 while the grid stays within max_tgs threadgroups and every
+  // partition keeps at least 256 columns.
+  while ((split_k < 4) && (tiles * split_k * 2 <= max_tgs) &&
+         (K % (split_k * 2 * k_align) == 0) && (K / (split_k * 2) >= 256)) {
+    split_k *= 2;
+  }
+  return split_k;
+}
+
+void qmm_splitk_nax(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  // The staged kernel needs an 8-byte aligned activation offset.
+  auto& compute_encoder = metal::get_command_encoder(s);
+  if ((x.dtype() != float32) && (x.offset() % 8 != 0)) {
+    array x_copy = contiguous_copy_gpu(x, s);
+    compute_encoder.add_temporary(x_copy);
+    return qmm_splitk_nax(
+        x_copy, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+  }
+
+  int bm = (M <= 32) ? 32 : 64;
+  int bn = 64;
+  int bk = 64;
+  int wm = 2;
+  int wn = 2;
+  MTL::Size group_dims(32, wn, wm);
+
+  if (use_qmm_t_nax_staged(x, true, true, false)) {
+    bm = 64;
+    wm = 4;
+    wn = 1;
+    // A flat threadgroup runs the 16-row schedule faster than (32, 1, wm).
+    group_dims = MTL::Size(32 * wm, 1, 1);
+  }
+
+  int split_k = qmm_nax_k_partitions(M, N, K, group_size);
+  if (split_k == 1) {
+    return qmm_nax(
+        x,
+        w,
+        scales,
+        biases,
+        std::nullopt,
+        out,
+        true,
+        group_size,
+        bits,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode);
+  }
+
+  int k_partition_size = K / split_k;
+  int split_k_partition_stride = M * N;
+
+  array intermediate({split_k, M, N}, float32, nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  compute_encoder.add_temporary(intermediate);
+
+  std::string type_string = get_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      mode + "_qmm_t_nax_splitk_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_hgs_0_alN_1_batch_0",
+      "_bm_",
+      bm,
+      "_bn_",
+      bn,
+      "_wm_",
+      wm,
+      "_wn_",
+      wn);
+  auto kernel = get_qmm_nax_kernel_wrapped(
+      d,
+      kname,
+      "qmm_t_nax_splitk",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      false, // has_global_scale
+      true, // aligned_n
+      false, // batch
+      bm,
+      bk,
+      bn,
+      wm,
+      wn);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases) {
+    compute_encoder.set_input_array(*biases, c);
+  }
+  c++;
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(intermediate, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  compute_encoder.set_bytes(k_partition_size, c++);
+  compute_encoder.set_bytes(split_k_partition_stride, c++);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(N / bn, ceildiv(M, bm), split_k), group_dims);
+
+  // Sum the partitions and cast to the output type.
+  auto accum_kname = "steel_gemm_splitk_accum_" + type_to_name(out) + "_" +
+      type_to_name(intermediate);
+  auto accum_kernel = get_steel_gemm_splitk_accum_kernel(
+      d, accum_kname, intermediate, out, false);
+  compute_encoder.set_compute_pipeline_state(accum_kernel);
+  compute_encoder.set_input_array(intermediate, 0);
+  compute_encoder.set_output_array(out, 1);
+  compute_encoder.set_bytes(split_k, 2);
+  compute_encoder.set_bytes(split_k_partition_stride, 3);
+  compute_encoder.set_bytes(N, 4);
+  compute_encoder.dispatch_threads(MTL::Size(N, M, 1), get_block_dims(N, M, 1));
+}
+
 void qmm_splitk(
     const array& x,
     const array& w,
@@ -1539,11 +1798,21 @@ void qmm_splitk(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool nax_route = true) {
+  // The split-K NAX route. macprovider: the LFM reference prefill
+  // (nax_route = false) keeps the split count of split_m below on every GPU.
+  if (nax_route && use_qmm_nax_splitk(x, M, N, K, group_size)) {
+    return qmm_splitk_nax(
+        x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+  }
+
   // Choose split_k to target ~512 threadgroups
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
   int m_tiles = (M + bm - 1) / bm;
+  // macprovider: split_m is the row count the split count follows (one row's
+  // sequence length on the LFM reference prefill, else M).
   int split_m_tiles = (split_m + bm - 1) / bm;
   int current_tgs = n_tiles * split_m_tiles;
   int split_k = std::max(1, 512 / current_tgs);
@@ -1605,9 +1874,23 @@ void qmm_splitk(
       group_size,
       "_b_",
       bits,
-      aligned ? "_alN_true" : "_alN_false");
+      "_hgs_0",
+      aligned ? "_alN_1" : "_alN_0",
+      "_batch_0_bm_32_bn_32");
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned);
+      d,
+      kname,
+      "qmm_t_splitk",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      false, // has_global_scale
+      aligned,
+      false, // batched
+      bm,
+      32, // bk
+      bn);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1692,7 +1975,7 @@ void gather_qmm(
 
   std::string kname;
   kname.reserve(64);
-  bool aligned = N % 32 == 0;
+  bool aligned_n = transpose && (N % bn == 0);
   std::string type_string = get_type_string(x.dtype());
   concatenate(
       kname,
@@ -1702,31 +1985,27 @@ void gather_qmm(
       group_size,
       "_b_",
       bits,
-      transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-      global_scale ? "_hgs" : "");
-  MTL::ComputePipelineState* kernel;
-  if (transpose) {
-    kernel = get_quantized_kernel_wrapped(
-        d,
-        kname,
-        "gather_qmm_t",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        aligned,
-        global_scale.has_value());
-  } else {
-    kernel = get_quantized_kernel_wrapped(
-        d,
-        kname,
-        "gather_qmm_n",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        global_scale.has_value());
-  }
+      global_scale ? "_hgs_1" : "_hgs_0",
+      aligned_n ? "_alN_1" : "_alN_0",
+      "_batch_0",
+      "_bm_",
+      bm,
+      "_bn_",
+      bn);
+  MTL::ComputePipelineState* kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      transpose ? "gather_qmm_t" : "gather_qmm_n",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      global_scale.has_value(),
+      aligned_n,
+      false, // batched
+      bm,
+      32, // bk
+      bn);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -1788,7 +2067,7 @@ void gather_qmv(
       group_size,
       "_b_",
       bits,
-      global_scale ? "_hgs" : "");
+      global_scale ? "_hgs_1" : "_hgs_0");
 
   auto kernel = get_quantized_kernel_wrapped(
       d,
@@ -1859,7 +2138,7 @@ void gather_qvm(
       group_size,
       "_b_",
       bits,
-      global_scale ? "_hgs" : "");
+      global_scale ? "_hgs_1" : "_hgs_0");
   auto kernel = get_quantized_kernel_wrapped(
       d,
       kname,
@@ -1957,24 +2236,18 @@ void gather_qmm_rhs_nax(
   std::string type_string = get_type_string(x.dtype());
   concatenate(
       kname,
-      mode +
-          (transpose ? "_gather_qmm_rhs_nax_nt_" : "_gather_qmm_rhs_nax_nn_"),
+      mode + "_gather_qmm_rhs_nax_",
       type_string,
       "_gs_",
       group_size,
       "_b_",
       bits,
+      global_scale ? "_hgs_1" : "_hgs_0",
+      transpose ? "_t_1" : "_t_0",
       "_bm_",
       bm,
       "_bn_",
-      bn,
-      "_bk_",
-      bk,
-      "_wm_",
-      wm,
-      "_wn_",
-      wn,
-      global_scale ? "_hgs" : "");
+      bn);
 
   metal::MTLFCList func_consts = {
       {&align_N, MTL::DataType::DataTypeBool, 201},
@@ -2002,16 +2275,16 @@ void gather_qmm_rhs_nax(
       hash_name,
       func_consts,
       x,
+      mode,
       group_size,
       bits,
-      mode,
+      global_scale.has_value(),
+      transpose,
       bm,
       bn,
       bk,
       wm,
-      wn,
-      transpose,
-      global_scale.has_value());
+      wn);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
@@ -2053,7 +2326,7 @@ void gather_qmm_rhs(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string mode) {
+    const std::string& mode) {
   if (metal::is_nax_available() &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
@@ -2122,23 +2395,14 @@ void gather_qmm_rhs(
   std::string type_string = get_type_string(x.dtype());
   concatenate(
       kname,
-      mode + (transpose ? "_gather_qmm_rhs_nt_" : "_gather_qmm_rhs_nn_"),
+      mode + "_gather_qmm_rhs_",
       type_string,
       "_gs_",
       group_size,
       "_b_",
       bits,
-      "_bm_",
-      bm,
-      "_bn_",
-      bn,
-      "_bk_",
-      bk,
-      "_wm_",
-      wm,
-      "_wn_",
-      wn,
-      global_scale ? "_hgs" : "");
+      global_scale ? "_hgs_1" : "_hgs_0",
+      transpose ? "_t_1" : "_t_0");
 
   metal::MTLFCList func_consts = {
       {&align_N, MTL::DataType::DataTypeBool, 201},
@@ -2166,16 +2430,16 @@ void gather_qmm_rhs(
       hash_name,
       func_consts,
       x,
+      mode,
       group_size,
       bits,
-      mode,
+      global_scale.has_value(),
+      transpose,
       bm,
       bn,
       bk,
       wm,
-      wn,
-      transpose,
-      global_scale.has_value());
+      wn);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
@@ -2216,7 +2480,8 @@ void dispatch_qmv(
     metal::Device& d,
     const Stream& s,
     const std::string& mode,
-    bool reference_prefill = false) {
+    bool reference_prefill = false,
+    bool upstream_routes = false) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits) &&
       !global_scale) {
@@ -2226,7 +2491,11 @@ void dispatch_qmv(
 
   // Flagged multi-token prefill follows the vendor route. Decode and ordinary
   // primitives keep the batch-invariant qmv path below.
-  if (reference_prefill && M >= 2 && use_qmv_wide(mode, d) && !global_scale) {
+  // macprovider: upstream_routes (dispatch_qmm_t, the upstream v0.32.5 route
+  // that small-row route 0 and QQMatmul take) keeps upstream's qmv_wide for
+  // every M >= 2.
+  if ((reference_prefill || upstream_routes) && M >= 2 &&
+      use_qmv_wide(mode, d) && !global_scale) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
@@ -2238,8 +2507,8 @@ void dispatch_qmv(
   // qmv_wide beats qmv. qmv_wide sums each vector in an order set by k_lanes
   // and the weight group alone; the vector tile (vecs_per_tg) only decides
   // how many vectors share one read of the weights, so a row matches its
-  // serial result while the weights are read once per tile of up to 5 rows
-  // instead of once per row.
+  // serial result while the weights are read once per tile of up to 8 rows
+  // (upstream's affine tile cap since v0.32.5) instead of once per row.
   // The route reads the weight shape and the device, never M:
   // - K not a multiple of 128 (gpt-oss, K = 2880) only. Aligned-K shapes
   //   that miss qmv_mma (N < 512) stay on qmv, where qmv_wide cost GLM-5-Next
@@ -2247,8 +2516,8 @@ void dispatch_qmv(
   // - Gen 15 and 16 only. On gen 17 (M5) qmv_wide lost about a fifth of
   //   single-row Qwen3-8B decode speed to qmv.
   int gen = d.get_architecture_gen();
-  if (mode == "affine" && gen >= 15 && gen <= 16 && (K % 128) != 0 &&
-      biases && !global_scale) {
+  if (!upstream_routes && mode == "affine" && gen >= 15 && gen <= 16 &&
+      (K % 128) != 0 && biases && !global_scale) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
@@ -2269,11 +2538,102 @@ void dispatch_qmv(
       mode);
 }
 
+// Routes a product with transposed quantized weights by its number of rows.
+void dispatch_qmm_t(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    bool non_batched,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    QuantizationMode qmode) {
+  int vector_limit = get_qmv_batch_limit(K, N, d);
+  auto mode = quantization_mode_to_string(qmode);
+
+  // For few rows use qmv_mma when N/K is large enough.
+  if (non_batched && (M <= 16) &&
+      use_qmv_mma(x, w, scales, qmode, group_size, bits, M, N, K, d)) {
+    qmv_mma(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  // For mid rows use NAX qmm when output is large enough.
+  if (non_batched && (M >= 8) && (M < vector_limit) && (M * N >= 16384) &&
+      use_qmm_nax_splitk(x, M, N, K, group_size)) {
+    qmm_splitk_nax(
+        x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  // It is a matrix matrix product.
+  if (M >= vector_limit) {
+    // Use split-K qmm for small M (non-batched only)
+    if (out.size() / M / N == 1) {
+      qmm_splitk(
+          x, w, scales, biases, out, group_size, bits, M, M, N, K, d, s, mode);
+      return;
+    }
+    qmm(x,
+        w,
+        scales,
+        biases,
+        std::nullopt,
+        out,
+        true,
+        group_size,
+        bits,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode);
+    return;
+  }
+
+  // Run of the mill qmv
+  dispatch_qmv(
+      x,
+      w,
+      scales,
+      biases,
+      std::nullopt,
+      out,
+      group_size,
+      bits,
+      M,
+      N,
+      K,
+      d,
+      s,
+      mode,
+      /* reference_prefill = */ false,
+      /* upstream_routes = */ true);
+}
+
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
 
+  // Return 0s if x is empty
+  if (inputs[0].size() == 0) {
+    array zero = array(0, out.dtype());
+    fill_gpu(zero, out, s);
+    metal::get_command_encoder(s).add_temporary(std::move(zero));
+    return;
+  }
+
   out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return;
+  }
 
   // Make sure the last two dims of x and w, s, b are contiguous. This should
   // be relaxed for x.
@@ -2286,7 +2646,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   // Extract the matmul shapes
-  bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
+  bool non_batched = (w.ndim() == 2) && x.flags().row_contiguous;
   int K = x.shape(-1);
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
@@ -2297,6 +2657,32 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       reference_prefill_ && non_batched && transpose_ && x.ndim() >= 3 &&
       x.shape(-2) > 1;
   int route_m = reference_prefill ? x.shape(-2) : M;
+
+  // macprovider: small-row route 0 (MLX_METAL_SMALL_M_ROW_INVARIANT=0, a
+  // process that never batches decode rows) is upstream's routing: the
+  // upstream v0.32.5 dispatch for transposed weights, with its M-dependent
+  // qmv_mma / qmv_nax / split-K choices. Routes 1 and 2 take the
+  // batch-invariant routes below. The LFM reference prefill keeps its own
+  // route on every small-row route.
+  if (transpose_ && !reference_prefill &&
+      small_m_route_ == small_m_route_serial_only) {
+    dispatch_qmm_t(
+        x,
+        w,
+        scales,
+        biases,
+        out,
+        group_size_,
+        bits_,
+        non_batched,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode_);
+    return;
+  }
 
   // macprovider: rows below the qmm route take the qmv_mma reduction when the
   // weight shape qualifies, from 1 row up: WK partial sums over 128-wide K
@@ -2455,7 +2841,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           K,
           d,
           s,
-          mode);
+          mode,
+          /* nax_route = */ false);
       return;
     }
     // macprovider: no qmm_splitk. Its split count follows the M tile count,
@@ -2521,7 +2908,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   // Qvm with large dimension so route to a split K kernel for more parallelism
-  qvm_split_k(
+  qvm_splitk(
       x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
   return;
 }
@@ -2530,7 +2917,18 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
 
+  // Return 0s if x is empty
+  if (inputs[0].size() == 0) {
+    array zero = array(0, out.dtype());
+    fill_gpu(zero, out, s);
+    metal::get_command_encoder(s).add_temporary(std::move(zero));
+    return;
+  }
+
   out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return;
+  }
 
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
@@ -2651,6 +3049,9 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto mode = quantization_mode_to_string(mode_);
 
   out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return;
+  }
 
   // - 2 inputs: x, w (non-quantized w)
   // - 3 inputs: x, w, scales_w (quantized w)
@@ -2680,13 +3081,32 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   array x = quantize_dequantize_input(
       x_pre, global_scale_x, mode, group_size_, bits_, d, s);
 
-  bool non_batched = w_q.ndim() == 2;
+  bool non_batched = (w_q.ndim() == 2);
   int K = x.shape(-1);
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
-  if (has_global_scales && w_quantized && non_batched &&
-      x.dtype() == bfloat16 && K % 32 == 0 &&
-      M >= get_qmv_batch_limit(K, N, d)) {
+
+  // Use the quantized_matmul routes, which do not take a global scale.
+  if (!has_global_scales) {
+    dispatch_qmm_t(
+        x,
+        w_q,
+        scales_w,
+        std::nullopt,
+        out,
+        group_size_,
+        bits_,
+        non_batched,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode_);
+    return;
+  }
+  if (w_quantized && non_batched && (x.dtype() == bfloat16) && (K % 32 == 0) &&
+      (M >= get_qmv_batch_limit(K, N, d))) {
     qmm(x,
         w_q,
         scales_w,
@@ -2718,8 +3138,7 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       K,
       d,
       s,
-      mode,
-      false);
+      mode);
 }
 
 void GatherQQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -2733,6 +3152,9 @@ void GatherQQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto mode = quantization_mode_to_string(mode_);
 
   out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return;
+  }
 
   // - 4 inputs: x, w (non-quantized w)
   // - 5 inputs: x, w, scales_w (quantized w)

@@ -355,6 +355,17 @@ TEST_CASE("test gguf tensor dimension validation") {
   }
 }
 
+TEST_CASE("test gguf tensor to f16 size overflow") {
+  // A non-equivalent dtype (BF16) tensor whose element count times
+  // sizeof(int16_t) overflows size_t. num_weights = 2^63 makes the
+  // gguf_tensor_to_f16 malloc size wrap to 0 while the dequant loop still
+  // writes 2^63 elements, a heap-buffer-overflow in libc malloc.
+  const uint32_t bf16 = 30;
+  std::string file_path = get_temp_file("test_gguf_f16_overflow.gguf");
+  write_raw_gguf_dims(file_path, {1ull << 31, 1ull << 32}, bf16, 0);
+  CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+}
+
 // Writes a metadata-only GGUF (no tensors) whose metadata KV section is
 // `kv_section` verbatim, so a caller can encode values whose lengths exceed the
 // file to exercise check_metadata_value_in_file(). `kv_count` must match the
@@ -466,6 +477,41 @@ TEST_CASE("test gguf metadata value validation") {
     std::string file_path = get_temp_file("test_gguf_meta_strarr_past.gguf");
     write_raw_gguf_metadata(file_path, 1, kv);
     CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+}
+
+TEST_CASE("test gguf metadata at unaligned offsets") {
+  std::string file_path = get_temp_file("test_unaligned_metadata.gguf");
+  std::unordered_map<std::string, array> weights = {{"w", array({1.0f, 2.0f})}};
+  std::unordered_map<std::string, GGUFMetaData> metadata = {
+      {"a", std::string("xyz")},
+      {"bcd", std::vector<std::string>{"e", "fgh", "ij"}},
+      {"efghi", array(7)},
+      {"jkl", array({1, -2, 3})},
+      {"m", array({1.5f, -2.5f})},
+      {"nopqr", astype(array({1, 2, 3}), uint64)},
+      {"stu", astype(array({-4, 5}), int16)},
+      {"v", astype(array({6, 7, 8}), uint8)},
+      {"wxyzw", array({true, false, true})}};
+  save_gguf(file_path, weights, metadata);
+
+  auto [loaded_weights, loaded_metadata] = load_gguf(file_path);
+  CHECK_EQ(loaded_metadata.size(), metadata.size());
+  CHECK_EQ(std::get<std::string>(loaded_metadata.at("a")), "xyz");
+  const std::vector<std::string> expected_bcd = {"e", "fgh", "ij"};
+  const auto& bcd =
+      std::get<std::vector<std::string>>(loaded_metadata.at("bcd"));
+  REQUIRE_EQ(bcd.size(), expected_bcd.size());
+  for (size_t i = 0; i < bcd.size(); ++i) {
+    CHECK_EQ(bcd[i], expected_bcd[i]);
+  }
+  CHECK_EQ(std::get<array>(loaded_metadata.at("efghi")).item<int>(), 7);
+  for (auto key : {"jkl", "m", "nopqr", "stu", "v", "wxyzw"}) {
+    CAPTURE(key);
+    const auto& expected = std::get<array>(metadata.at(key));
+    const auto& loaded = std::get<array>(loaded_metadata.at(key));
+    CHECK_EQ(loaded.dtype(), expected.dtype());
+    CHECK(array_equal(loaded, expected).item<bool>());
   }
 }
 

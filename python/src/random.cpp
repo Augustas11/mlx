@@ -5,8 +5,6 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
-#include <chrono>
-
 #include "mlx/ops.h"
 #include "mlx/random.h"
 #include "python/src/random.h"
@@ -42,14 +40,8 @@ class PyKeySequence {
 
   nb::list& state() {
     if (!state_) {
-      static auto time_seed = []() {
-        auto now = std::chrono::system_clock::now();
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                   now.time_since_epoch())
-            .count();
-      }();
       state_ = nb::list();
-      state_->append(mx::random::key(time_seed));
+      state_->append(mx::random::key(mx::random::KeySequence::default_seed()));
     }
     return *state_;
   }
@@ -236,6 +228,10 @@ void init_random(nb::module_& parent_module) {
         distribution is used. That means $x \sim \mathcal{N}(0, 1)$ for
         real numbers and $\text{Re}(x),\text{Im}(x) \sim \mathcal{N}(0,
         \frac{1}{2})$ for complex numbers.
+
+        .. note::
+           Outputs are deterministic for a given key on a given machine, but
+           they are not guaranteed to be bit-exact across GPU architectures.
 
         Args:
             shape (list(int), optional): Shape of the output. Default: ``()``.

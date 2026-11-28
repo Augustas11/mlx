@@ -9,18 +9,8 @@
 
 namespace mlx::core {
 
-void AsStrided::eval(const std::vector<array>& inputs, array& out) {
-  assert(inputs.size() == 1);
-
-  auto& in = inputs[0];
-
-  if (!in.flags().row_contiguous) {
-    // Just ensuring that inputs[0] came from the ops which would ensure the
-    // input is row contiguous.
-    throw std::runtime_error(
-        "AsStrided must be used with row contiguous arrays only.");
-  }
-
+void AsStrided::eval(const array& in, array& out) {
+  assert(in.flags().row_contiguous);
   auto [_, row_contiguous, col_contiguous] = check_contiguity(shape_, strides_);
 
   int64_t l = 0, h = 0;
@@ -51,7 +41,7 @@ void AsStrided::eval(const std::vector<array>& inputs, array& out) {
   flags.row_contiguous = row_contiguous;
   flags.col_contiguous = col_contiguous;
 
-  return out.copy_shared_buffer(in, strides_, flags, data_size, offset_);
+  out.copy_shared_buffer(in, strides_, flags, data_size, offset_);
 }
 
 void Broadcast::eval(const std::vector<array>& inputs, array& out) {
@@ -157,6 +147,7 @@ void shared_buffer_reshape(
     const Strides& out_strides,
     array& out) {
   auto flags = in.flags();
+  auto data_size = in.data_size();
   if (flags.row_contiguous) {
     // For row contiguous reshapes:
     // - Shallow copy the buffer
@@ -170,8 +161,12 @@ void shared_buffer_reshape(
         check_contiguity(out.shape(), out_strides);
     flags.row_contiguous = row_contiguous;
     flags.col_contiguous = col_contiguous;
+    if (row_contiguous || col_contiguous) {
+      flags.contiguous = true;
+      data_size = out.size();
+    }
   }
-  out.copy_shared_buffer(in, out_strides, flags, in.data_size());
+  out.copy_shared_buffer(in, out_strides, flags, data_size);
 }
 
 void Split::eval(
